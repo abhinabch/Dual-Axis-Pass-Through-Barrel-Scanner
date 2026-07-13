@@ -1,0 +1,153 @@
+"""
+creality_autostart.py
+
+Automates the two manual clicks in Creality Scan (Preview/Setup -> Start)
+using image matching, since the app's buttons are custom-drawn (Tier B:
+not visible to the Windows accessibility layer).
+
+REQUIREMENTS (run once, on the Windows machine that runs Creality Scan):
+    pip install pyautogui opencv-python pygetwindow pillow
+
+BEFORE YOU RUN THIS: capture the button template images (see "TEMPLATE
+SETUP" below). The script cannot work without them.
+
+WHAT IT DOES
+    1. Finds and focuses the CrealityScan window.
+    2. Locates and clicks the "Preview" button (Scan Settings screen).
+    3. Polls the screen (does NOT sleep-and-hope) until either:
+         - the "Start" button image appears, or
+         - a timeout is hit (meaning something went wrong - e.g. a
+           calibration dialog, an error popup, "Too Close" warning, etc.)
+    4. Clicks "Start".
+    5. Logs each step so you can see exactly where it succeeded or failed.
+
+WHAT IT DELIBERATELY DOES NOT DO YET (per the brief)
+    - Stopping the scan / saving the STL / moving the file - later step.
+    - Coordinating with Node-RED for pan/tilt motion - later step.
+    - Filling in Setup dialog fields - add if your workflow needs it once
+      you confirm Setup requires no manual input.
+"""
+
+import sys
+import time
+import logging
+
+import pyautogui
+import pygetwindow as gw
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("creality_autostart")
+
+# ---------------------------------------------------------------------------
+# CONFIG - tune these for your machine
+# ---------------------------------------------------------------------------
+
+WINDOW_TITLE_SUBSTRING = "CrealityScan"   # matches the title bar text
+
+# Template images - see "TEMPLATE SETUP" below for how to create these.
+TEMPLATE_PREVIEW_BUTTON = "templates/preview_button.png"
+TEMPLATE_START_BUTTON = "templates/start_button.png"
+
+# How sure a match needs to be (0-1). Lower this if a real match isn't
+# being found; raise it if it's clicking the wrong thing. Requires
+# opencv-python to be installed for the `confidence` parameter to work.
+MATCH_CONFIDENCE = 0.85
+
+# How long to wait for each UI transition before giving up.
+CLICK_TIMEOUT_SECONDS = 20
+POLL_INTERVAL_SECONDS = 0.5
+
+# Safety: moving the mouse to a screen corner aborts the script.
+pyautogui.FAILSAFE = True
+
+
+class AutomationError(RuntimeError):
+    """Raised when a required UI element can't be found in time."""
+
+
+# ---------------------------------------------------------------------------
+# Core helpers
+# ---------------------------------------------------------------------------
+
+def focus_creality_window() -> None:
+    """Find the Creality Scan window and bring it to the foreground.
+
+    Image matching is done against the whole screen, so if the window is
+    minimized, behind another window, or off-screen, matching will fail
+    (or worse, match a stale image cached from before). Focusing first
+    removes an entire class of flaky failures.
+    """
+    matches = [w for w in gw.getAllTitles() if WINDOW_TITLE_SUBSTRING.lower() in w.lower()]
+    if not matches:
+        raise AutomationError(
+            f"No window found with title containing '{WINDOW_TITLE_SUBSTRING}'. "
+            "Is Creality Scan running?"
+        )
+
+    win = gw.getWindowsWithTitle(matches[0])[0]
+    if win.isMinimized:
+        win.restore()
+    win.activate()
+    time.sleep(0.5)  # brief settle time after window activation, not a UI-state wait
+    log.info("Focused window: %s", win.title)
+
+
+def wait_for_and_click(template_path: str, label: str, timeout: float = CLICK_TIMEOUT_SECONDS):
+    """Poll the screen for a button image and click its center as soon as it appears.
+
+    This replaces a fixed sleep with an actual state check, per the
+    reconnaissance notes: Start only becomes clickable once Setup/Preview
+    has finished processing, and that duration isn't fixed.
+    """
+    log.info("Waiting for '%s' button (timeout %.0fs)...", label, timeout)
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        location = pyautogui.locateCenterOnScreen(
+            template_path, confidence=MATCH_CONFIDENCE
+        )
+        if location is not None:
+            pyautogui.moveTo(location, duration=0.2)
+            pyautogui.click()
+            log.info("Clicked '%s' at %s", label, location)
+            return location
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    raise AutomationError(
+        f"Timed out after {timeout}s waiting for the '{label}' button. "
+        f"Possible causes: an unexpected dialog is covering it, the "
+        f"template image ({template_path}) no longer matches (theme/"
+        f"resolution/scaling changed), or the app is in an error state. "
+        f"Take a screenshot now and compare it to {template_path}."
+    )
+
+
+def run_scan_start_sequence() -> None:
+    focus_creality_window()
+
+    # Step 1: click Preview (this is the "Setup" click - it moves the app
+    # from the Scan Settings screen into the live camera/calibration view).
+    wait_for_and_click(TEMPLATE_PREVIEW_BUTTON, "Preview")
+
+    # Step 2: wait for the app to be ready, then click Start.
+    # This single wait_for_and_click call *is* the "wait for ready state"
+    # logic - it only clicks once the Start button image is actually on
+    # screen, rather than clicking after a guessed delay.
+    wait_for_and_click(TEMPLATE_START_BUTTON, "Start")
+
+    log.info("Scan start sequence complete.")
+
+
+if __name__ == "__main__":
+    try:
+        run_scan_start_sequence()
+    except AutomationError as exc:
+        log.error(str(exc))
+        sys.exit(1)
+    except Exception:
+        log.exception("Unexpected error during automation")
+        sys.exit(1)
