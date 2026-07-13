@@ -126,6 +126,42 @@ def wait_for_and_click(template_path: str, label: str, timeout: float = CLICK_TI
     )
 
 
+def wait_for_screen_transition(
+    old_template: str,
+    new_template: str,
+    label: str,
+    timeout: float = CLICK_TIMEOUT_SECONDS,
+):
+    """Wait until `new_template` appears AND `old_template` has disappeared.
+
+    Two near-identical buttons in the same toolbar slot (e.g. Preview and
+    Start both being a cyan play-triangle icon) can cause a false-positive
+    match on the *previous* screen right as it's mid-transition. Requiring
+    the old button to be gone as well guards against clicking too early.
+    """
+    log.info("Waiting for screen transition to '%s' (timeout %.0fs)...", label, timeout)
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        old_still_there = pyautogui.locateOnScreen(old_template, confidence=MATCH_CONFIDENCE) is not None
+        new_location = pyautogui.locateCenterOnScreen(new_template, confidence=MATCH_CONFIDENCE)
+
+        if new_location is not None and not old_still_there:
+            pyautogui.moveTo(new_location, duration=0.2)
+            pyautogui.click()
+            log.info("Clicked '%s' at %s", label, new_location)
+            return new_location
+
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    raise AutomationError(
+        f"Timed out after {timeout}s waiting for transition to '{label}'. "
+        f"Either the previous screen never went away (old_template still "
+        f"matching), or {new_template} never appeared. Take a screenshot "
+        f"now and compare both templates against it."
+    )
+
+
 def run_scan_start_sequence() -> None:
     focus_creality_window()
 
@@ -133,11 +169,16 @@ def run_scan_start_sequence() -> None:
     # from the Scan Settings screen into the live camera/calibration view).
     wait_for_and_click(TEMPLATE_PREVIEW_BUTTON, "Preview")
 
-    # Step 2: wait for the app to be ready, then click Start.
-    # This single wait_for_and_click call *is* the "wait for ready state"
-    # logic - it only clicks once the Start button image is actually on
-    # screen, rather than clicking after a guessed delay.
-    wait_for_and_click(TEMPLATE_START_BUTTON, "Start")
+    # Small settle delay: give the app a moment to actually start
+    # redrawing before we begin polling, so we don't catch a leftover
+    # frame of the old screen still showing the Preview button image.
+    time.sleep(1.0)
+
+    # Step 2: wait for the OLD (Preview) button to be gone AND the Start
+    # button to be present, then click Start. This guards against the
+    # false-positive case where Start's template loosely matches the
+    # still-visible Preview button (same icon shape, same toolbar slot).
+    wait_for_screen_transition(TEMPLATE_PREVIEW_BUTTON, TEMPLATE_START_BUTTON, "Start")
 
     log.info("Scan start sequence complete.")
 
