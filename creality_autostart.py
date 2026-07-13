@@ -14,10 +14,10 @@ SETUP" below). The script cannot work without them.
 WHAT IT DOES
     1. Finds and focuses the CrealityScan window.
     2. Locates and clicks the "Preview" button (Scan Settings screen).
-    3. Polls the screen (does NOT sleep-and-hope) until either:
-         - the "Start" button image appears, or
-         - a timeout is hit (meaning something went wrong - e.g. a
-           calibration dialog, an error popup, "Too Close" warning, etc.)
+    3. Polls the screen for the "Please click [Start] to scan" banner -
+       the app's own readiness signal - instead of guessing a fixed delay
+       or relying on the Start button icon alone (which looks nearly
+       identical to the Preview icon and can false-match mid-transition).
     4. Clicks "Start".
     5. Logs each step so you can see exactly where it succeeded or failed.
 
@@ -51,6 +51,14 @@ WINDOW_TITLE_SUBSTRING = "CrealityScan"   # matches the title bar text
 # Template images - see "TEMPLATE SETUP" below for how to create these.
 TEMPLATE_PREVIEW_BUTTON = "templates/preview_button.png"
 TEMPLATE_START_BUTTON = "templates/start_button.png"
+
+# "Please click [Start] to scan" - the banner text that appears top-center
+# once the app is actually ready. This is a much more reliable readiness
+# signal than the Start button icon, since the icon is a cyan play-triangle
+# that looks nearly identical to the Preview icon (same shape, same toolbar
+# slot) and can false-match mid-transition. This text string only appears
+# in one state.
+TEMPLATE_READY_TEXT = "templates/ready_text.png"
 
 # How sure a match needs to be (0-1). Lower this if a real match isn't
 # being found; raise it if it's clicking the wrong thing. Requires
@@ -126,39 +134,25 @@ def wait_for_and_click(template_path: str, label: str, timeout: float = CLICK_TI
     )
 
 
-def wait_for_screen_transition(
-    old_template: str,
-    new_template: str,
-    label: str,
-    timeout: float = CLICK_TIMEOUT_SECONDS,
-):
-    """Wait until `new_template` appears AND `old_template` has disappeared.
+def wait_for_element(template_path: str, label: str, timeout: float = CLICK_TIMEOUT_SECONDS):
+    """Poll the screen for a template until it appears. Does not click anything.
 
-    Two near-identical buttons in the same toolbar slot (e.g. Preview and
-    Start both being a cyan play-triangle icon) can cause a false-positive
-    match on the *previous* screen right as it's mid-transition. Requiring
-    the old button to be gone as well guards against clicking too early.
+    Used for the ready-text banner, which is a state signal, not a button.
     """
-    log.info("Waiting for screen transition to '%s' (timeout %.0fs)...", label, timeout)
+    log.info("Waiting for '%s' to appear (timeout %.0fs)...", label, timeout)
     deadline = time.time() + timeout
 
     while time.time() < deadline:
-        old_still_there = pyautogui.locateOnScreen(old_template, confidence=MATCH_CONFIDENCE) is not None
-        new_location = pyautogui.locateCenterOnScreen(new_template, confidence=MATCH_CONFIDENCE)
-
-        if new_location is not None and not old_still_there:
-            pyautogui.moveTo(new_location, duration=0.2)
-            pyautogui.click()
-            log.info("Clicked '%s' at %s", label, new_location)
-            return new_location
-
+        location = pyautogui.locateCenterOnScreen(template_path, confidence=MATCH_CONFIDENCE)
+        if location is not None:
+            log.info("'%s' detected.", label)
+            return location
         time.sleep(POLL_INTERVAL_SECONDS)
 
     raise AutomationError(
-        f"Timed out after {timeout}s waiting for transition to '{label}'. "
-        f"Either the previous screen never went away (old_template still "
-        f"matching), or {new_template} never appeared. Take a screenshot "
-        f"now and compare both templates against it."
+        f"Timed out after {timeout}s waiting for '{label}' to appear. "
+        f"Take a screenshot now and compare it to {template_path} - the "
+        f"crop, confidence, or app state may have changed."
     )
 
 
@@ -169,16 +163,13 @@ def run_scan_start_sequence() -> None:
     # from the Scan Settings screen into the live camera/calibration view).
     wait_for_and_click(TEMPLATE_PREVIEW_BUTTON, "Preview")
 
-    # Small settle delay: give the app a moment to actually start
-    # redrawing before we begin polling, so we don't catch a leftover
-    # frame of the old screen still showing the Preview button image.
-    time.sleep(1.0)
+    # Step 2: wait for the "Please click [Start] to scan" banner - the
+    # actual readiness signal from the app - before touching Start.
+    wait_for_element(TEMPLATE_READY_TEXT, "ready-to-scan banner")
 
-    # Step 2: wait for the OLD (Preview) button to be gone AND the Start
-    # button to be present, then click Start. This guards against the
-    # false-positive case where Start's template loosely matches the
-    # still-visible Preview button (same icon shape, same toolbar slot).
-    wait_for_screen_transition(TEMPLATE_PREVIEW_BUTTON, TEMPLATE_START_BUTTON, "Start")
+    # Step 3: now that we've confirmed readiness via the banner, the Start
+    # button click is safe - no ambiguity left about which screen we're on.
+    wait_for_and_click(TEMPLATE_START_BUTTON, "Start", timeout=5)
 
     log.info("Scan start sequence complete.")
 
