@@ -3,9 +3,19 @@
 ## 📋 Project Overview
 In the wine and spirits industry, the precise characterization of a barrel's internal geometry is critical. The oak-to-liquid contact ratio directly influences the chemical extraction, flavor profile, and aging velocity of the wine. However, standard cooperage volumes vary due to the natural irregularities of wood bending and hand-shaving processes.
 
-To accurately calculate the internal volume and exact surface area of these wine barrels, this project deploys a high-resolution **Creality CR-Scan Ferret SE 3D scanner** inside the barrel. The machine is dropped onto a standard barrel bung hole (~38mm), expands its scanning payload inside the container using mechanical linkages, and executes a coordinated dual-axis scan sweep—all while keeping the sensitive electronics completely isolated outside the harsh internal environment of the barrel.
+To accurately calculate the internal volume and exact surface area of these wine barrels, this project deploys a high-resolution **Creality CR-Scan Ferret SE 3D scanner** inside the barrel. The machine is dropped onto a standard barrel bung hole (~38mm) and operates using a custom coaxial Pan/Tilt Turret Assembly housed inside a cylindrical tube. This design isolates all sensitive electronics and motors outside or at the rear of the tube, allowing only the scanning payload to enter the barrel.
 
 Initially conceived as a Node-RED project, the control system has been shifted to a **unified, pure Python control stack** to allow for native multi-threading safety, clean version control, and seamless integration between physical motor control (Modbus RTU) and scanner UI automation (PyAutoGUI).
+
+---
+
+## ⚙️ Mechanical Design: Coaxial Pan/Tilt Turret Assembly
+The physical scanner utilizes a compact, coaxial nested design to fit the dual-axis mechanism through the narrow 38mm barrel bung hole:
+
+* **Housing**: Cylindrical tube; all components are mounted inside the tube.
+* **Rotation (Pan) Axis**: Driven by a large stepper motor (iDM57-RS23) fixed to a rear bracket inside the tube, aligned with the tube's central axis. Spinning this motor rotates the entire turret assembly around the tube's long axis.
+* **Tilt Axis**: Driven by a smaller stepper motor (ESS17-RS04) also mounted at the rear, adjacent to the rotation motor. The tilt motor's shaft is a worm screw that meshes with a large blue worm gear. This blue gear is fixed to a central shaft that runs forward through the center of the assembly to a red bracket at the front, terminating in a second worm screw that tilts the camera mount.
+* **Coaxial Nesting**: The tilt shaft (blue gear → front red bracket) shares the centerline of the main rotation shaft. Because the tilt shaft passes through the middle of the rotating assembly, the tilt drivetrain rotates along with the turret during panning. Tilt motion remains independently controlled by the small rear motor, but its shaft physically travels with the pan rotation.
 
 ---
 
@@ -13,18 +23,18 @@ Initially conceived as a Node-RED project, the control system has been shifted t
 
 ```mermaid
 graph TD
-    subgraph Control Station (Host PC)
+    subgraph "Control Station (Host PC)"
         PythonApp[Python Control App / GUI]
         PythonScripts[Python Automation Scripts]
         CrealityApp[Creality Scan App]
     end
 
-    subgraph Electronics Enclosure
+    subgraph "Electronics Enclosure"
         USB485[USB-to-RS485 Adapter]
         PowerBus[DC Power Bus]
     end
 
-    subgraph Actuators & Sensor Payload (Physical Robot)
+    subgraph "Actuators & Sensor Payload (Physical Robot)"
         MotorPan[Pan Axis: iDM57-RS23 Stepper]
         MotorTilt[Tilt Axis: ESS17-RS04 Closed-Loop Stepper]
         Scanner[Creality CR-Scan Ferret SE]
@@ -45,7 +55,7 @@ graph TD
 | :--- | :--- | :--- | :--- |
 | **Weeks 1–2** | Mechanical Design Review & Bench Setup | <ul><li>Review concept sketches and Fusion 360 models</li><li>Verify initial motion translation parameters (pan gear ratio, tilt steps-per-degree)</li><li>Verify python serial communications and PyAutoGUI environment</li><li>*Current Status: Completed*</li></ul> | All calibration parameters documented; Python development environment verified. |
 | **Weeks 3–4** | Python GUI & Motor Test Interface | <ul><li>Provide single-motor Python jog functions to unblock Reina's bring-up check</li><li>Write unified `DualAxisController` class utilizing `pymodbus`</li><li>Develop `app_gui.py` using `customtkinter` with sliders, position readbacks, and emergency stop</li></ul> | Both motors responding correctly to Modbus commands from Python GUI. |
-| **Weeks 5–6** | Integration & Kinematic Calibration | <ul><li>Take delivery of the fabricated hardware from Beringer's machine shop</li><li>Confirm as-built mechanical parameters (belt reduction, cradle geometry, limits)</li><li>Program steps-per-degree calibration into the Python controller</li><li>Verify pan (±180°) and tilt (±90°) motion ranges</li></ul> | Coordinated, precise position control matching software target coordinates to physical positions. |
+| **Weeks 5–6** | Integration & Kinematic Calibration | <ul><li>Take delivery of the fabricated hardware from Beringer's machine shop</li><li>Confirm as-built mechanical parameters (worm gear ratios, coaxial alignment)</li><li>Program steps-per-degree calibration into the Python controller</li><li>Implement kinematic cross-coupling compensation between Pan and Tilt axes</li><li>Verify pan (±180°) and tilt (±90°) motion ranges</li></ul> | Coordinated, precise position control matching software target coordinates to physical positions. |
 | **Weeks 7–8** | Creality Software Bridge & Safety Watchdog | <ul><li>Integrate `creality_autostart.py` automation sequence into the GUI loop</li><li>Implement background safety thread (`SafetyWatchdog`) to poll ESS17-RS04 position error registers and cut torque on jam</li><li>Run end-to-end trials on experimental barrels</li></ul> | **August 21st:** Final delivery of fully operational, dual-axis automated scanner in Python. |
 
 ---
@@ -164,14 +174,17 @@ These motion parameters tell the control software how motor steps translate into
 ### 1. Pan Axis (iDM57-RS23 Stepper)
 * **Slave ID (Modbus)**: `1`
 * **Microstepping (default)**: `1600 steps/rev`
-* **Gear reduction**: `3:1` GT2 belt drive
-* **Calibration constant**: `4800 steps` per full scabbard revolution ($1600 \times 3$)
+* **Drive Mechanism**: Coaxial direct/geared rotation of entire turret assembly
+* **Calibration constant**: Steps per full revolution based on internal motor step angle and any primary stage reduction
 * **Travel limits**: ±180°
 
 ### 2. Tilt Axis (ESS17-RS04 Closed-Loop Stepper)
 * **Slave ID (Modbus)**: `2`
-* **Drive Mechanism**: Rack-and-pinion linear drive push-rod
-* **Calibration constant**: Steps-per-degree conversion derived from pinion tooth count and cradle linkage geometry
+* **Drive Mechanism**: Coaxial central shaft driven by rear worm gear, terminating in a front worm screw.
+* **Calibration constant**: Steps-per-degree conversion derived from the double-stage worm reduction (rear worm gear ratio $\times$ front camera-bracket worm ratio).
+* **Kinematic Cross-Coupling**: Since the tilt shaft is nested within the rotating pan assembly, rotating the pan axis while keeping the stationary tilt motor locked will cause the tilt shaft to roll along the tilt motor's worm screw. The software controller must implement a mixing equation to compensate:
+  $$\Delta \text{Steps}_{\text{Tilt}} = \text{Steps}_{\text{Target Tilt}} + k \cdot \Delta \text{Steps}_{\text{Pan}}$$
+  *(where $k$ is the coupling coefficient determined by the gear ratios).*
 * **Travel limits**: ±90° (internal safety check monitors the position error register to cut torque if mechanical binding occurs)
 
 ---
