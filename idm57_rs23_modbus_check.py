@@ -59,7 +59,7 @@ def read_registers(address, count=1):
     # Passed positionally on purpose: the keyword name for the unit/slave ID
     # has changed across pymodbus versions (unit -> slave -> device_id), but
     # the positional order (address, count, id) has stayed the same.
-    result = client.read_holding_registers(address, count, UNIT_ID)
+    result = client.read_holding_registers(address=address, count=count, device_id=UNIT_ID)
     if result.isError():
         raise ModbusException(f"Read failed at address {address}: {result}")
     return result.registers
