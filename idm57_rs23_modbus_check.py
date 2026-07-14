@@ -56,7 +56,10 @@ def connect():
 
 def read_registers(address, count=1):
     """Read `count` holding registers starting at `address`. Returns a list of ints."""
-    result = client.read_holding_registers(address=address, count=count, slave=UNIT_ID)
+    # Passed positionally on purpose: the keyword name for the unit/slave ID
+    # has changed across pymodbus versions (unit -> slave -> device_id), but
+    # the positional order (address, count, id) has stayed the same.
+    result = client.read_holding_registers(address, count, UNIT_ID)
     if result.isError():
         raise ModbusException(f"Read failed at address {address}: {result}")
     return result.registers
