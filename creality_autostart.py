@@ -72,6 +72,12 @@ POLL_INTERVAL_SECONDS = 0.5
 # Safety: moving the mouse to a screen corner aborts the script.
 pyautogui.FAILSAFE = True
 
+# Disable PyAutoGUI raising ImageNotFoundException if image not found (return None instead)
+try:
+    pyautogui.useImageNotFoundException(False)
+except AttributeError:
+    pass
+
 
 class AutomationError(RuntimeError):
     """Raised when a required UI element can't be found in time."""

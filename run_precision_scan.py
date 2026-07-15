@@ -90,6 +90,12 @@ TEMPLATE_WARNING_OK_BUTTON = "templates/warning_ok_button.png"
 # Safety: PyAutoGUI fail-safe (move cursor to top-left / corners to abort)
 pyautogui.FAILSAFE = True
 
+# Disable PyAutoGUI raising ImageNotFoundException if image not found (return None instead)
+try:
+    pyautogui.useImageNotFoundException(False)
+except AttributeError:
+    pass
+
 class AutomationError(RuntimeError):
     """Raised when a GUI automation check fails."""
 
