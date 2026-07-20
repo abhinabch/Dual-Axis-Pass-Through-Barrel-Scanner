@@ -26,6 +26,7 @@ WHAT IT DELIBERATELY DOES NOT DO YET (per the brief)
     - Coordinating with Node-RED for pan/tilt motion - later step.
     - Filling in Setup dialog fields - add if your workflow needs it once
       you confirm Setup requires no manual input.
+
 """
 
 import sys
