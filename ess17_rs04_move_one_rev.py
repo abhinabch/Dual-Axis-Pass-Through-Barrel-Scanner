@@ -59,9 +59,16 @@ REG_AUX_CONTROL = 0x002D        # Auxiliary control command (write-only)
 # ---------------------------------------------------------------------------
 # Move parameters - conservative values for a first-ever test on this motor
 # ---------------------------------------------------------------------------
-PULSES_PER_REV = 4000            # CONFIRM against register 0x0101 (Encoder
-                                  # resolution) on your actual drive before
-                                  # relying on this for a full revolution.
+PULSES_PER_REV = 1000            # Corrected from a live test: commanding
+                                  # 4000 pulses produced 4 full revolutions,
+                                  # meaning this drive's position register
+                                  # counts 1 pulse per encoder line (1000
+                                  # PPR) rather than the 4x-multiplied count
+                                  # the manual's register 0x0101 describes.
+                                  # If you later read 0x0101 and it differs
+                                  # from 1000, recalibrate this value the
+                                  # same way: command N pulses, measure
+                                  # actual revolutions, divide.
 STARTING_SPEED_RPM = 10          # starting speed for the trapezoidal ramp
 TEST_VELOCITY_RPM = 20           # slow test speed, r/min
 TEST_ACCEL_MS = 200              # acceleration time, ms (plain ms on this
