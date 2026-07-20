@@ -1,14 +1,17 @@
 """
 ESS17-RS04 - Rotate exactly one revolution, safely
 ----------------------------------------------------
-Adapted from the iDM57-RS23 script. The ESS17-RS04 is StepperOnline's
-NEMA17 integrated closed-loop stepper (RS485/Modbus, "Bus Series").
-It uses the same PR-path Modbus register map as the iDM-RS series
-(confirmed against the iDM-RS manual: Pr9.00-Pr9.07 map to the same
-addresses 0x6200-0x6207 in both product families), so this script is
-structurally identical - only motor-specific values differ.
+Register map confirmed against StepperOnline's official
+"Modbus Series Bus Driver Function Manual" (Appendix 2: ESS-RS Series).
 
-This will NOT move the motor if a fault is active or the drive is disabled.
+This is a DIFFERENT register map than the iDM57-RS23 script this was
+originally adapted from - the iDM-RS "PR Path 0" registers (0x6200-0x6207)
+do NOT apply to this drive. The ESS-RS family uses its own, simpler set
+of registers in the 0x0000-0x0030 range, confirmed directly from the
+manual you provided.
+
+This will NOT move the motor if a fault is active or the drive is released
+(disabled).
 
 Install dependency first:
     pip install pymodbus
@@ -17,11 +20,12 @@ Run:
     python ess17_rs04_move_one_rev.py
 
 IMPORTANT - please confirm before running:
-  - PULSES_PER_REV below matches your drive's actual Pr0.00 setting.
-  - BAUDRATE/UNIT_ID match your drive's configured communication
-    parameters (check DIP switches / parameter table on your unit).
-  - TEST_VELOCITY_RPM is conservative for a first test on this motor
-    (0.48 N.m holding torque - smaller than the RS23 used previously).
+  - PULSES_PER_REV below (4000) matches Modbus register 0x0101
+    ("Encoder resolution") on your actual drive. The manual states this
+    defaults to 4x the encoder line count (1000-line encoder -> 4000),
+    which matches the ESS17-RS04 datasheet's 1000 PPR encoder - but
+    please verify by reading 0x0101 before relying on it.
+  - TEST_VELOCITY_RPM is conservative for a first test.
 """
 
 import time
@@ -33,45 +37,40 @@ from pymodbus.exceptions import ModbusException
 # ---------------------------------------------------------------------------
 SERIAL_PORT = "COM3"
 BAUDRATE = 115200
-UNIT_ID = 2
+UNIT_ID = 2          # confirmed slave ID for this drive
 TIMEOUT = 2
 
 # ---------------------------------------------------------------------------
-# Registers - same PR-path Modbus map as the iDM-RS series
-# (StepperOnline's "Bus Series" Modbus manual is shared across the
-# integrated stepper/servo product line, including ESS-RS models)
+# Registers - confirmed from "Modbus Series Bus Driver Function Manual",
+# Appendix 2: Modbus Register Parameter Table - ESS-RS Series
 # ---------------------------------------------------------------------------
-STATUS_REGISTER = 4099        # 0x1003 - Motion state bitmask
+STATUS_REGISTER = 0x0007        # Motion status bit (read-only)
+ERROR_CODE_REGISTER = 0x0006    # 0 = normal, 1-5 = error (read-only)
 
-# PR Path 0 registers ("PR Path Configuration" section)
-REG_CONTROL_WORD = 0x6200     # Pr9.00 - PR path 0 control/mode word
-REG_POSITION_H = 0x6201       # Pr9.01 - Position, high 16 bits
-REG_POSITION_L = 0x6202       # Pr9.02 - Position, low 16 bits
-REG_VELOCITY = 0x6203         # Pr9.03 - velocity, unit: rpm
-REG_ACC = 0x6204              # Pr9.04 - acceleration, unit: ms/1000rpm
-REG_DEC = 0x6205              # Pr9.05 - deceleration, unit: ms/1000rpm
-REG_PAUSE = 0x6206            # Pr9.06 - pause time after command stops
-REG_TRIGGER = 0x6207          # Pr9.07 - special parameter, mirrors Pr8.02.
-                              # Writing 0x0010 here fires the move
-                              # ("Immediate Trigger" method).
+REG_STARTING_SPEED = 0x0020     # Starting speed of positioning move, r/min
+REG_ACCEL = 0x0021              # Acceleration time, ms
+REG_DECEL = 0x0022              # Deceleration time, ms
+REG_VELOCITY = 0x0023           # Positioning movement speed, r/min
+REG_POSITION_H = 0x0024         # Total pulse count, high 16 bits
+REG_POSITION_L = 0x0025         # Total pulse count, low 16 bits
+REG_MOVEMENT_CONTROL = 0x0027   # Movement control command (write-only)
+REG_AUX_CONTROL = 0x002D        # Auxiliary control command (write-only)
 
 # ---------------------------------------------------------------------------
 # Move parameters - conservative values for a first-ever test on this motor
 # ---------------------------------------------------------------------------
-PULSES_PER_REV = 10000          # Pr0.00 default - CONFIRM this matches your
-                                # drive's actual setting before running.
-                                # (ESS17-RS04 has a 1000-line/1000PPR encoder,
-                                # but the electronic gear ratio - not the raw
-                                # encoder count - determines pulses/rev here.)
-TEST_VELOCITY_RPM = 20           # slower than the RS23 test, since this is a
-                                  # smaller NEMA17 motor (0.48 N.m holding torque)
-TEST_ACCEL_MS_PER_1000RPM = 300  # gentle ramp up
-TEST_DECEL_MS_PER_1000RPM = 300  # gentle ramp down
+PULSES_PER_REV = 4000            # CONFIRM against register 0x0101 (Encoder
+                                  # resolution) on your actual drive before
+                                  # relying on this for a full revolution.
+STARTING_SPEED_RPM = 10          # starting speed for the trapezoidal ramp
+TEST_VELOCITY_RPM = 20           # slow test speed, r/min
+TEST_ACCEL_MS = 200              # acceleration time, ms (plain ms on this
+TEST_DECEL_MS = 200              # drive - not "ms per 1000rpm")
 
-# Control word: bit0=1 (position mode) + bit6=1 (relative move)
-# Relative move = moves from wherever the shaft currently is, rather than
-# to an absolute coordinate - safer when you haven't verified home position.
-CONTROL_WORD_RELATIVE_POSITION_MOVE = (1 << 0) | (1 << 6)  # = 0x0041
+# Movement control word (register 0x0027) bit values:
+#   bit0 = start position-mode move
+#   bit2 = 0 -> relative positioning, 1 -> absolute positioning
+START_RELATIVE_POSITION_MOVE = 0x0001   # bit0=1, bit2=0 (relative)
 
 client = ModbusSerialClient(
     port=SERIAL_PORT,
@@ -105,12 +104,13 @@ def write_registers(address, values):
 
 def decode_status(word):
     return {
-        "faulty": bool(word & (1 << 0)),
-        "enabled": bool(word & (1 << 1)),
+        "in_position": bool(word & (1 << 0)),
+        "homing_completed": bool(word & (1 << 1)),
         "running": bool(word & (1 << 2)),
-        "command_completed": bool(word & (1 << 4)),
-        "path_completed": bool(word & (1 << 5)),
-        "homing_completed": bool(word & (1 << 6)),
+        "alarm": bool(word & (1 << 3)),
+        "motor_released": bool(word & (1 << 4)),  # True = disabled/released
+        "positive_soft_limit": bool(word & (1 << 5)),
+        "negative_soft_limit": bool(word & (1 << 6)),
     }
 
 
@@ -119,11 +119,12 @@ def check_status():
     status = decode_status(word)
     print(f"Motion state: {status}")
 
-    if status["faulty"]:
-        print("FAULT ACTIVE - aborting. Clear the fault before retrying.")
+    if status["alarm"]:
+        error_code = read_registers(ERROR_CODE_REGISTER, 1)[0]
+        print(f"ALARM ACTIVE (error code {error_code}) - aborting. Clear the fault before retrying.")
         return False, status
-    if not status["enabled"]:
-        print("Drive is DISABLED - aborting. Check DI1/enable source.")
+    if status["motor_released"]:
+        print("Motor is RELEASED (disabled) - aborting. Enable the motor before retrying.")
         return False, status
 
     return True, status
@@ -146,36 +147,33 @@ def rotate_one_revolution():
     print(f"\nWriting move parameters: "
           f"{PULSES_PER_REV} pulses (1 rev), "
           f"{TEST_VELOCITY_RPM} rpm, "
-          f"accel/decel {TEST_ACCEL_MS_PER_1000RPM}/{TEST_DECEL_MS_PER_1000RPM} ms per 1000rpm")
+          f"accel/decel {TEST_ACCEL_MS}/{TEST_DECEL_MS} ms")
 
-    # Control word written first, then position/velocity/acc/dec/pause,
-    # and the trigger register written LAST and separately - so nothing
-    # moves until every other parameter is already in place.
-    write_registers(REG_CONTROL_WORD, [
-        CONTROL_WORD_RELATIVE_POSITION_MOVE,   # 0x6200
-    ])
-    write_registers(REG_POSITION_H, [
-        position_h,                    # 0x6201
-        position_l,                    # 0x6202
-        TEST_VELOCITY_RPM,             # 0x6203
-        TEST_ACCEL_MS_PER_1000RPM,     # 0x6204
-        TEST_DECEL_MS_PER_1000RPM,     # 0x6205
-        0,                             # 0x6206 pause time
+    # Write acceleration, deceleration, speed, and total pulse count
+    # (registers 0x0021-0x0025) in one block, matching the manual's own
+    # example sequence. The movement control register (0x0027) is written
+    # separately and last, so nothing moves until every parameter is set.
+    write_registers(REG_ACCEL, [
+        TEST_ACCEL_MS,      # 0x0021
+        TEST_DECEL_MS,      # 0x0022
+        TEST_VELOCITY_RPM,  # 0x0023
+        position_h,         # 0x0024
+        position_l,         # 0x0025
     ])
 
     print("Parameters written. Triggering move now...")
-    write_registers(REG_TRIGGER, [0x0010])  # 0x6207 - fires the move
+    write_registers(REG_MOVEMENT_CONTROL, [START_RELATIVE_POSITION_MOVE])  # 0x0027
 
-    # Poll status until the path completes or we hit a timeout
+    # Poll status until the move completes or we hit a timeout
     timeout_s = 15
     start = time.time()
     while time.time() - start < timeout_s:
         word = read_registers(STATUS_REGISTER, 1)[0]
         status = decode_status(word)
-        if status["faulty"]:
-            print("FAULT occurred during motion!", status)
+        if status["alarm"]:
+            print("ALARM occurred during motion!", status)
             return
-        if status["path_completed"] and not status["running"]:
+        if status["in_position"] and not status["running"]:
             print("Move completed successfully.", status)
             return
         time.sleep(0.2)
