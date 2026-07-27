@@ -7,6 +7,30 @@ To accurately calculate the internal volume and exact surface area of these wine
 
 Initially conceived as a Node-RED project, the control system has been shifted to a **unified, pure Python control stack** to allow for native multi-threading safety, clean version control, and seamless integration between physical motor control (Modbus RTU) and scanner UI automation (PyAutoGUI).
 
+## Pipeline Overview
+
+Barrels are reconstructed from `.obscan` point clouds through a spherical height-field representation, cleaned (bung/outlier/crease-aware smoothing), converted to a watertight mesh, and measured.
+
+```mermaid
+flowchart LR
+    A[".obscan file"] --> B["load_cloud()"]
+    B --> C["fit_axis()"]
+    C --> D["spherical_coords()"]
+    D --> E["build_rho_grid()"]
+    E --> F{"cleanup"}
+    F -->|rules| G["rule-based cleanup\n(bung / outlier / smooth)"]
+    F -->|learned| H["learned cleanup\n(see barrel_learned_cleanup_plan.md)"]
+    G --> I["grid_to_mesh()"]
+    H --> I
+    I --> J["watertight mesh\n(PLY / STL)"]
+    I --> K["run_crozehead_analysis()"]
+    K --> L["measurements + profile CSVs"]
+```
+
+See [docs/PIPELINE_GUIDE.md](docs/PIPELINE_GUIDE.md) for a full start-to-finish walkthrough (single file and batch), and [barrel_learned_cleanup_plan.md](barrel_learned_cleanup_plan.md) for the plan to replace the rule-based cleanup stage with a learned model.
+
+**Cleanup status**: rule-based cleanup (`--cleanup rules`, default) is production. Learned cleanup (`--cleanup learned`) is in development — see the plan doc for phase status.
+
 ---
 
 ## ⚙️ Mechanical Design: Coaxial Pan/Tilt Turret Assembly
@@ -79,6 +103,13 @@ Dual-Axis-Pass-Through-Barrel-Scanner/
 │   └── ready_text.png
 │
 ├── app_gui.py                    # Modern CustomTkinter Dashboard UI
+├── barrel_synth.py               # Synthetic barrel generator for training data
+├── barrel_features.py            # Curvature / crease feature extraction
+├── barrel_denoise_grid.py        # Learned grid-domain denoiser
+├── barrel_denoise_points.py      # Learned point-level outlier classifier
+├── barrel_eval.py                # Evaluation metrics for rules vs. learned cleanup
+├── train_grid_denoiser.py        # Training entry point for the grid denoiser
+├── train_point_classifier.py     # Training entry point for the point classifier
 ├── idm57_rs23_modbus_check.py    # Initial diagnostics check tool
 ├── idm57_rs23_move_one_rev.py    # Initial motion proof-of-concept
 └── README.md
