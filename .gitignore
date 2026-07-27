@@ -1,0 +1,6 @@
+# Large scan raw data files
+*.obscan
+
+# Python cache files
+__pycache__/
+*.pyc

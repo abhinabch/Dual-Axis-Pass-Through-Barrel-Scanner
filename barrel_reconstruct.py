@@ -66,6 +66,7 @@ HEAD_POLE_MARGIN_DEG = 3.0 # keep flat-head extrapolation this far inside the cr
                            # corner when estimating each head plane (flatten_head_poles)
 WRITE_STL   = True         # also emit a binary STL beside each PLY
 STL_UNITS_MM = False       # True: scale STL metres->mm (endcap_metrics.py expects mm); False: keep metres
+CLEANUP_MODE = "rules"     # 'rules' (baseline thresholding) or 'learned' (PointNet + U-Net)
 
 
 # ── Load ───────────────────────────────────────────────────────────────────────
@@ -559,12 +560,15 @@ def out_path(tag, ext, stem):
     return os.path.join(d, "%s_barrel_%s.%s" % (stem, tag, ext))
 
 
-def reconstruct_one(src):
+def reconstruct_one(src, cleanup_mode=None):
     """Reconstruct one .obscan; write <stem>_barrel_clean/axisym.ply to OUT_DIR.
     Returns a summary dict."""
+    if cleanup_mode is None:
+        cleanup_mode = CLEANUP_MODE
+
     stem = os.path.splitext(os.path.basename(src))[0]
     print("\n" + "=" * 70)
-    print("%s" % src)
+    print("%s [cleanup=%s]" % (src, cleanup_mode))
     P, N = load_cloud(src)
     print("  %d vertices" % len(P))
 
@@ -577,6 +581,19 @@ def reconstruct_one(src):
     print("  axis dir [%.4f %.4f %.4f]  length %.4f m" % (a[0], a[1], a[2], L))
     print("  wall points %d (%.1f%%), head points %d (%.1f%%)"
           % (n_wall, 100 * n_wall / len(P), len(P) - n_wall, 100 * (len(P) - n_wall) / len(P)))
+
+    # Phase 3 PointNet Pre-binning point filter (learned mode only)
+    if cleanup_mode == "learned":
+        try:
+            from barrel_denoise_points import filter_points_pre_binning
+            keep_mask, pt_probs = filter_points_pre_binning(P, N)
+            P = P[keep_mask]
+            N = N[keep_mask]
+            naxis = naxis[keep_mask]
+            print("  [learned] PointNet pre-binning filter: kept %d / %d points (dropped %d)" %
+                  (len(P), len(keep_mask), len(keep_mask) - len(P)))
+        except Exception as exc:
+            print("  [learned] PointNet pre-binning filter skipped: %s" % exc)
 
     # centre the spherical map at the mid-length point on the axis
     mid = centre + (z.mean()) * a
@@ -591,31 +608,46 @@ def reconstruct_one(src):
 
     # separate wall / head height fields so they never blend across the corner
     grid, gw, gh = combine_wall_head(az, el, rho, wall_flag, N_AZ, el_edges)
-    # flat-head extrapolation of empty pole rows (kills the central head spindle)
-    grid, n_pole_fixed = flatten_head_poles(grid, el_ctr, corners)
-    filled_empty = int(np.isnan(grid).sum())
-    print("  grid %dx%d cells, %d empty before fill (%.2f%%); "
-          "flat-head pole rows fixed: %d"
-          % (n_el, N_AZ, filled_empty, 100 * filled_empty / grid.size, n_pole_fixed))
 
-    bung_mask, info = detect_bung(grid, BUNG_SEED_MM, MIN_BUNG_CELLS, el_ctr,
-                                  corners, int(BUNG_MAX_AZ_DEG / 360.0 * N_AZ))
-    if info.get("bung_cells"):
-        print("  bung: %d cells at el=%.1f deg, az=%.1f deg (span %.0f deg; clusters %s)"
-              % (info["bung_cells"], info["el_deg"], info["az_deg"],
-                 info["az_span_deg"], info["sizes"]))
-    else:
-        why = "ring feature rejected" if info.get("rejected_ring") else "none over threshold"
-        print("  bung: %s (seed clusters %s)" % (why, info.get("sizes")))
+    if cleanup_mode == "learned":
+        # Phase 2 U-Net learned grid denoiser
+        try:
+            from barrel_denoise_grid import learned_clean_grid
+            cnt = build_rho_grid(az, el, rho, N_AZ, el_edges)[1]
+            clean, bung_mask = learned_clean_grid(grid, cnt, corners, el_ctr)
+            bad = bung_mask | np.isnan(grid)
+            info = {"bung_cells": int(bung_mask.sum())}
+            print("  [learned] GridUNet clean grid complete (bung cells: %d)" % info["bung_cells"])
+        except Exception as exc:
+            print("  [learned] GridUNet fallback to rules due to error: %s" % exc)
+            cleanup_mode = "rules"
 
-    # reject gross per-row outliers (stray corner/pole cells) but keep genuine
-    # gentle azimuthal asymmetry (ovality); then fill from the symmetric wall
-    med_r, _ = _row_median_mad(grid)
-    gross = np.isfinite(grid) & (np.abs(grid - med_r[:, None]) > GROSS_OUTLIER_MM / 1000.0)
-    print("  gross outlier cells rejected: %d" % int(gross.sum()))
-    bad = bung_mask | np.isnan(grid) | gross
-    clean = fill_grid(grid, bad)
-    clean = smooth_grid(clean, el_ctr, corners, SMOOTH_PASSES)
+    if cleanup_mode == "rules":
+        # flat-head extrapolation of empty pole rows (kills the central head spindle)
+        grid, n_pole_fixed = flatten_head_poles(grid, el_ctr, corners)
+        filled_empty = int(np.isnan(grid).sum())
+        print("  grid %dx%d cells, %d empty before fill (%.2f%%); "
+              "flat-head pole rows fixed: %d"
+              % (n_el, N_AZ, filled_empty, 100 * filled_empty / grid.size, n_pole_fixed))
+
+        bung_mask, info = detect_bung(grid, BUNG_SEED_MM, MIN_BUNG_CELLS, el_ctr,
+                                      corners, int(BUNG_MAX_AZ_DEG / 360.0 * N_AZ))
+        if info.get("bung_cells"):
+            print("  bung: %d cells at el=%.1f deg, az=%.1f deg (span %.0f deg; clusters %s)"
+                  % (info["bung_cells"], info["el_deg"], info["az_deg"],
+                     info["az_span_deg"], info["sizes"]))
+        else:
+            why = "ring feature rejected" if info.get("rejected_ring") else "none over threshold"
+            print("  bung: %s (seed clusters %s)" % (why, info.get("sizes")))
+
+        # reject gross per-row outliers (stray corner/pole cells) but keep genuine
+        # gentle azimuthal asymmetry (ovality); then fill from the symmetric wall
+        med_r, _ = _row_median_mad(grid)
+        gross = np.isfinite(grid) & (np.abs(grid - med_r[:, None]) > GROSS_OUTLIER_MM / 1000.0)
+        print("  gross outlier cells rejected: %d" % int(gross.sum()))
+        bad = bung_mask | np.isnan(grid) | gross
+        clean = fill_grid(grid, bad)
+        clean = smooth_grid(clean, el_ctr, corners, SMOOTH_PASSES)
 
     # idealized: az-median per el-row => surface of revolution on the same grid
     axisym = np.repeat(np.nanmedian(clean, axis=1)[:, None], N_AZ, axis=1)
@@ -630,11 +662,11 @@ def reconstruct_one(src):
     ei = el_bin_index(el, el_edges)
     resid = rho - clean[ei, ai]
     keep = ~bad[ei, ai]                              # exclude filled bung cells
-    rr = resid[keep]
+    rr = resid[keep] if keep.any() else np.array([0.0])
     # crozehead-region fidelity: points within CORNER_HALF_DEG of either corner
     near = keep & ((np.abs(el - corners[0]) < np.deg2rad(CORNER_HALF_DEG)) |
                    (np.abs(el - corners[1]) < np.deg2rad(CORNER_HALF_DEG)))
-    cr = resid[near]
+    cr = resid[near] if near.any() else np.array([0.0])
     print("  fidelity to raw points: RMS %.2f mm, 95%%=%.2f mm, max %.2f mm"
           % (1000 * np.sqrt((rr ** 2).mean()),
              1000 * np.percentile(np.abs(rr), 95), 1000 * np.abs(rr).max()))
@@ -642,8 +674,8 @@ def reconstruct_one(src):
           % (1000 * np.sqrt((cr ** 2).mean()), 1000 * np.abs(cr).max()))
 
     result = {"src": src, "stem": stem, "verts_in": len(P), "length": L,
-              "fidelity_rms": 1000 * np.sqrt((rr ** 2).mean()),
-              "asym_rms": 1000 * np.sqrt((asym ** 2).mean()),
+              "fidelity_rms": float(1000 * np.sqrt((rr ** 2).mean())),
+              "asym_rms": float(1000 * np.sqrt((asym ** 2).mean())),
               "bung": info.get("bung_cells", 0)}
     for tag, g in (("clean", clean), ("axisym", axisym)):
         verts, faces = grid_to_mesh(g, mid, a, u, w, N_AZ, el_ctr)
@@ -671,14 +703,23 @@ def reconstruct_one(src):
 
 def main():
     import glob
-    args = [a for a in sys.argv[1:]]
-    if args:
-        files = args
-    else:                                            # batch: every .obscan in OUT_DIR
+    cleanup_mode = CLEANUP_MODE
+    raw_args = [a for a in sys.argv[1:]]
+    files = []
+    i = 0
+    while i < len(raw_args):
+        if raw_args[i] == "--cleanup" and i + 1 < len(raw_args):
+            cleanup_mode = raw_args[i + 1]
+            i += 2
+        else:
+            files.append(raw_args[i])
+            i += 1
+
+    if not files:
         files = sorted(glob.glob(os.path.join(OUT_DIR, "*.obscan")))
     if not files:
         sys.exit("no .obscan found in %s" % OUT_DIR)
-    print("Batch reconstructing %d scan(s) from %s" % (len(files), OUT_DIR))
+    print("Batch reconstructing %d scan(s) from %s (cleanup=%s)" % (len(files), OUT_DIR, cleanup_mode))
     for sub in sorted(set(OUT_SUBDIRS.values())):    # ensure output folders exist
         os.makedirs(os.path.join(OUT_DIR, sub), exist_ok=True)
     print("Output folders: %s" % ", ".join(sorted(set(OUT_SUBDIRS.values()))))
@@ -686,7 +727,7 @@ def main():
     results = []
     for src in files:
         try:
-            results.append(reconstruct_one(src))
+            results.append(reconstruct_one(src, cleanup_mode=cleanup_mode))
         except Exception as exc:                     # keep the batch going
             print("  !! FAILED %s: %s" % (src, exc))
 
