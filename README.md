@@ -27,7 +27,7 @@ flowchart LR
     K --> L["measurements + profile CSVs"]
 ```
 
-See [docs/PIPELINE_GUIDE.md](docs/PIPELINE_GUIDE.md) for a full start-to-finish walkthrough (single file and batch), and [barrel_learned_cleanup_plan.md](barrel_learned_cleanup_plan.md) for the plan to replace the rule-based cleanup stage with a learned model.
+See [docs/PIPELINE_GUIDE.md](docs/PIPELINE_GUIDE.md) for a full start-to-finish walkthrough (single file and batch), and [docs/LEARNED_CLEANUP_PLAN.md](docs/LEARNED_CLEANUP_PLAN.md) for the plan to replace the rule-based cleanup stage with a learned model.
 
 **Cleanup status**: rule-based cleanup (`--cleanup rules`, default) is production. Learned cleanup (`--cleanup learned`) is in development — see the plan doc for phase status.
 
@@ -91,27 +91,38 @@ A unified Python stack allows for a modular, clean package design:
 ```
 Dual-Axis-Pass-Through-Barrel-Scanner/
 │
-├── core/
-│   ├── __init__.py
-│   ├── motor_controller.py       # Manages Modbus RTU serial comms (Pan & Tilt)
-│   ├── ui_automation.py          # Refactored creality_autostart.py logic
-│   └── safety_watchdog.py        # Background thread monitoring position errors
+├── hardware/                          # Hardware control & PyAutoGUI automation
+│   ├── creality_autostart.py
+│   ├── ess17_rs04_move_one_rev.py
+│   ├── idm57_rs23_modbus_check.py
+│   ├── idm57_rs23_move_one_rev.py
+│   └── run_precision_scan.py
 │
-├── templates/                    # CV Template crops for PyAutoGUI
-│   ├── preview_button.png
-│   ├── start_button.png
-│   └── ready_text.png
+├── reconstruction/                    # Core 3D reconstruction & volume pipeline
+│   ├── barrel_reconstruct.py          # Primary entry point (spherical map, volume)
+│   ├── barrel_batch.py                # Batch STL analysis wrapper
+│   ├── barrel_features.py             # Curvature / crease feature extraction
+│   ├── barrel_denoise_grid.py         # Learned GridUNet denoiser
+│   ├── barrel_denoise_points.py       # Learned PointNet classifier
+│   ├── barrel_synth.py                # Synthetic barrel data generator
+│   └── barrel_eval.py                # Metrics evaluation harness
 │
-├── app_gui.py                    # Modern CustomTkinter Dashboard UI
-├── barrel_synth.py               # Synthetic barrel generator for training data
-├── barrel_features.py            # Curvature / crease feature extraction
-├── barrel_denoise_grid.py        # Learned grid-domain denoiser
-├── barrel_denoise_points.py      # Learned point-level outlier classifier
-├── barrel_eval.py                # Evaluation metrics for rules vs. learned cleanup
-├── train_grid_denoiser.py        # Training entry point for the grid denoiser
-├── train_point_classifier.py     # Training entry point for the point classifier
-├── idm57_rs23_modbus_check.py    # Initial diagnostics check tool
-├── idm57_rs23_move_one_rev.py    # Initial motion proof-of-concept
+├── notebooks/                         # Interactive ML workflows & visualizations
+│   ├── 01_synthetic_data.ipynb        # Synthetic data generation & 3D plots
+│   ├── 02_train_grid_denoiser.ipynb   # GridUNet training & loss curves
+│   ├── 03_train_point_classifier.ipynb # PointNet training & metrics
+│   └── 04_evaluate_models.ipynb       # Pipeline evaluation & comparison
+│
+├── models/                            # PyTorch model checkpoints
+│   ├── grid_denoiser_best.pt
+│   └── point_classifier_best.pt
+│
+├── docs/                              # Documentation & Guides
+│   ├── PIPELINE_GUIDE.md              # Complete volume script guide
+│   └── LEARNED_CLEANUP_PLAN.md        # Phased ML cleanup roadmap
+│
+├── templates/                         # CV Template crops for PyAutoGUI
+├── app_gui.py                         # CustomTkinter Dashboard UI
 └── README.md
 ```
 

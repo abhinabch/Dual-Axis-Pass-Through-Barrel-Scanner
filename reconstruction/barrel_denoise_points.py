@@ -18,7 +18,7 @@ import torch.nn.functional as F
 import numpy as np
 
 DEFAULT_POINT_CHECKPOINT = os.path.join(
-    os.path.dirname(__file__), "point_classifier_best.pt"
+    os.path.dirname(__file__), "..", "models", "point_classifier_best.pt"
 )
 
 

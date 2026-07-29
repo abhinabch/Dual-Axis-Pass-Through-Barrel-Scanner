@@ -39,7 +39,7 @@ blender_stub.install()          # must precede `import barrel_pipeline`
 # math behind the blender_stub shim.  After the repo was split into sibling
 # `blender/` and `standalone/` folders it lives one level up in `blender/`; add
 # that to sys.path so the import resolves either way (also works if kept alongside).
-_BLENDER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "blender")
+_BLENDER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "blender")
 if os.path.isdir(_BLENDER_DIR) and _BLENDER_DIR not in sys.path:
     sys.path.insert(0, _BLENDER_DIR)
 
