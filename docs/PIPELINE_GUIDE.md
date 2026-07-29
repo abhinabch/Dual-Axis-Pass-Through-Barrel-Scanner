@@ -1,183 +1,157 @@
-# Pipeline Guide
+# Barrel Volume & Reconstruction Pipeline Guide
 
-This guide is the practical, copy-paste walkthrough for running the barrel reconstruction pipeline from a single .obscan scan or from a directory of STL meshes.
+This guide provides a comprehensive, step-by-step walkthrough for running the 3D barrel reconstruction and volume analysis scripts.
 
-The high-level flow is:
+---
+
+## 🏗️ Overview & Architecture
+
+The scanner captures internal 3D geometry of wine and spirits barrels. The entry point **`barrel_reconstruct.py`** processes raw `.obscan` scan files (or fused point clouds) into clean, watertight 3D meshes (PLY and STL) and computes key geometrical metrics including internal volume in **Litres**.
 
 ```mermaid
 flowchart TD
-    A["input_dir/*.stl"] --> B["load_stl()"]
-    B --> C["detect_scale()"]
-    C --> D["barrel_clean.clean_mesh()"]
-    D --> E["run_crozehead_analysis()\n(via blender_stub shim)"]
-    E --> F["per_file/<name>_measurements.csv"]
-    E --> G["per_file/<name>_profile.csv"]
-    E --> H["per_file/<name>.log"]
-    F --> I["write_combined()"]
-    G --> I
-    I --> J["measurements_summary.csv"]
-    I --> K["profiles_combined.csv"]
+    A[".obscan File / Raw Cloud"] --> B["1. load_cloud()\nExtract positions & normals"]
+    B --> C["2. fit_axis()\nRobust surface-of-revolution axis fit"]
+    C --> D["3. spherical_coords()\nHeight field rho(az, el) about centre"]
+    D --> E["4. combine_wall_head()\nSeparate wall & head polar binning"]
+    E --> F{"5. Cleanup Stage"}
+    F -->|--cleanup rules| G["Rules Cleanup\nFlat-head pole fill, bung detect, outlier fill"]
+    F -->|--cleanup learned| H["Learned Cleanup\nPointNet pre-binning + GridUNet denoiser"]
+    G --> I["6. grid_to_mesh()\nWatertight UV-sphere grid & decimation"]
+    H --> I
+    I --> J["7. Mesh Exports & Volume Calculation\n clean_ply, clean_stl, volume (L), area (m²)"]
 ```
 
-## 1. Prerequisites
+---
 
-- Python 3.9 or newer
-- Install the packages imported by the current reconstruction entry points:
+## ⚙️ 1. Prerequisites & Dependencies
+
+Ensure Python 3.9+ is installed along with the required libraries:
 
 ```bash
 pip install numpy scipy trimesh
 ```
 
-If you want to exercise the learned cleanup path and the training scripts, also install:
+If you plan to run or train the **learned cleanup path**, also install PyTorch:
 
 ```bash
 pip install torch scikit-learn
 ```
 
-## 2. Single-file reconstruction
+---
 
-The single-file entry point is [barrel_reconstruct.py](../barrel_reconstruct.py). The current command-line shape is:
+## 🚀 2. Single-File Volume & Reconstruction Script (`barrel_reconstruct.py`)
 
-```bash
-python barrel_reconstruct.py --cleanup rules "C:/raw barrel/resources.obscan"
-```
+The primary reconstruction tool is **`reconstruction/barrel_reconstruct.py`**.
 
-### What the current flags do
+### Basic Usage
 
-- `--cleanup rules` (default) uses the production rule-based cleanup path.
-- `--cleanup learned` switches to the learned cleanup path when the model checkpoints are available; the script will fall back to rules if the learned stage cannot run.
-- The positional argument is one or more .obscan files to reconstruct. If you omit it, the script falls back to the default output directory and looks for .obscan files there.
-
-### What gets written
-
-The reconstruction scripts write output variants into the output folders under the hard-coded output root (the script defaults to `C:/raw barrel` unless you change it in code). The current writer creates these folders:
-
-- clean_ply/ — clean PLY meshes
-- axisym_ply/ — axisymmetric PLY meshes
-- clean_stl/ — clean STL meshes
-- axisym_stl/ — axisymmetric STL meshes
-
-Each output file is named like:
-
-- `<stem>_barrel_clean.ply`
-- `<stem>_barrel_axisym.ply`
-- `<stem>_barrel_clean.stl`
-- `<stem>_barrel_axisym.stl`
-
-## 3. Batch processing
-
-The batch entry point is [barrel_batch.py](../barrel_batch.py). A typical run is:
+To run reconstruction on an `.obscan` file using default rule-based cleanup:
 
 ```bash
-python barrel_batch.py "C:/path/to/stl_dir" --out "C:/path/to/barrel_output" --pattern "*.stl" --max-passes 3 --overlap auto --scale auto --verbose
+python reconstruction/barrel_reconstruct.py "C:/path/to/scan.obscan"
 ```
 
-### Batch flags
+To run using the **learned cleanup pipeline** (PointNet pre-filter + GridUNet denoiser):
 
-- `--out DIR` — output directory for the combined CSVs and per-file subfolder.
-- `--pattern GLOB` — glob used to find input STL files.
-- `--max-passes N` — maximum bung detect/remove/fill passes during cleanup.
-- `--no-clean` — skip cleanup and analyse the raw mesh.
-- `--no-despindle` — do not remove the artificial central spike at each head.
-- `--overlap auto|on|off` — whether to run internal overlap-face removal; `auto` skips it for large meshes above the `--overlap-max-faces` threshold.
-- `--overlap-max-faces N` — face-count threshold used by `--overlap auto`.
-- `--scale auto|FLOAT` — rescale mesh extent to metre scale; `auto` uses the nearest power-of-ten factor, while `1` disables rescaling.
-- `--verbose` — echo full per-file pipeline output to the terminal.
-- `--rebuild-only` — skip analysis and rebuild the combined outputs from existing per-file CSVs.
+```bash
+python reconstruction/barrel_reconstruct.py --cleanup learned "C:/path/to/scan.obscan"
+```
 
-### What the batch outputs contain
+---
 
-The batch run writes:
+### Step-by-Step Instructions: What Happens Under the Hood
 
-- `measurements_summary.csv` — one row per input STL, with one wide column per measurement parameter.
-- `profiles_combined.csv` — one row per profile sample from each barrel, with a `source_file` column.
-- `per_file/` — one subfolder per processed file containing:
-  - `<name>_measurements.csv`
-  - `<name>_profile.csv`
-  - `<name>.log`
+When you execute `barrel_reconstruct.py`, it proceeds through the following precise steps:
 
-## 4. Reading the outputs
+#### Step 1: Loading Point Cloud (`load_cloud`)
+- Connects to SQLite inside `.obscan` (read-only mode).
+- Extracts vertex position $(x, y, z)$ and unit normals $(n_x, n_y, n_z)$ from `mesh_vn_0.bat`.
 
-The batch wrapper does not invent a new schema; it preserves the measurement columns emitted by the underlying Blender analysis step. The most common columns are:
+#### Step 2: Fitting Barrel Axis (`fit_axis`)
+- Seeds initial axis vector using PCA covariance.
+- Refines rotation axis and centre using Powell optimization to minimize within-slice radial Median Absolute Deviation (MAD).
 
-| Column family | Meaning |
+#### Step 3: Spherical Height-Field Mapping (`spherical_coords`)
+- Maps points relative to the barrel centre into spherical coordinates:
+  - $\text{Azimuth } az \in [-\pi, \pi]$
+  - $\text{Elevation } el \in [0, \pi]$ (0 at +axis pole, $\pi$ at −axis pole)
+  - $\text{Radius } \rho$ (distance from centre)
+
+#### Step 4: Polar Grid Binning (`make_el_sampling`, `combine_wall_head`)
+- Packs dense polar rows around each crozehead corner to sharply capture the crease where stave wall meets the head disc.
+- Separately bins wall points ($|n \cdot a| < 0.5$) and head points ($|n \cdot a| \ge 0.5$) so corners do not blur across regions.
+
+#### Step 5: Cleanup & Denoising Mode
+- **Rules Mode (`--cleanup rules`)**:
+  - `flatten_head_poles()`: Extrapolates missing pole rows using the flat-head secant law $\rho(el) = h / \cos(el)$, preventing central spindle spikes.
+  - `detect_bung()`: Identifies the bung patch (>6mm excess, staves only, compact azimuth) and masks it.
+  - `fill_grid()` & `smooth_grid()`: Replaces gross outliers and bung cells with row-median wall values and applies light crease-preserving smoothing.
+- **Learned Mode (`--cleanup learned`)**:
+  - `filter_points_pre_binning()`: Runs PointNet on raw points to filter floater clusters.
+  - `learned_clean_grid()`: Runs GridUNet 2D CNN to repair grid NaNs and remove bungs.
+
+#### Step 6: Watertight Mesh Generation (`grid_to_mesh`)
+- Converts $\rho(az, el)$ into a watertight 3D triangle mesh.
+- Decimates azimuth resolution towards poles to avoid radial pole pinch on head discs.
+- Ensures outward face winding for mathematically precise volume calculation.
+
+#### Step 7: Output & Volume Calculation
+- Calculates exact internal enclosed volume via signed tetrahedron integration:
+  $$\text{Volume} = \frac{1}{6} \sum_{f} \mathbf{v}_0 \cdot (\mathbf{v}_1 \times \mathbf{v}_2)$$
+- Writes meshes to configured output subfolders.
+
+---
+
+### Output File Structure
+
+Outputs are written into subdirectories under `OUT_DIR` (default: `C:/raw barrel` or relative to script):
+
+```
+OUT_DIR/
+├── clean_ply/    <stem>_barrel_clean.ply     (Denoised mesh, bung filled)
+├── clean_stl/    <stem>_barrel_clean.stl     (Binary STL for CAD / FEA)
+├── axisym_ply/   <stem>_barrel_axisym.ply    (Ideal surface-of-revolution)
+└── axisym_stl/   <stem>_barrel_axisym.stl    (Axisymmetric STL)
+```
+
+---
+
+## 📦 3. Batch STL Analysis Script (`barrel_batch.py`)
+
+To process a directory of existing barrel STL meshes and extract detailed measurement CSVs:
+
+```bash
+python reconstruction/barrel_batch.py "C:/path/to/stl_directory" --out "C:/path/to/output_dir" --pattern "*.stl"
+```
+
+### Key Flags
+- `--out DIR`: Output directory for combined CSV summaries.
+- `--no-clean`: Skip bung removal and clean steps (analyze raw STL).
+- `--scale auto|FLOAT`: Auto-detects units (mm vs metres) and scales to metres.
+
+### Batch Outputs
+- `measurements_summary.csv`: Wide table containing total volume (L), axial span (mm), bilge radius, crozehead radius per barrel.
+- `profiles_combined.csv`: Combined radial profile curves from crozehead to crozehead.
+- `per_file/`: Detailed per-barrel logs and measurement CSVs.
+
+---
+
+## 🔬 4. Jupyter Notebook Workflow
+
+For interactive ML model training, tuning, and evaluation, use the notebooks in `notebooks/`:
+
+| Notebook | Purpose |
 | --- | --- |
-| axial span | axial length of the barrel from one crozebevel to the other. |
-| crozehead radius | radius at the crozehead/crozebevel corner where wall meets head. |
-| bilge radius | widest mid-span radius of the barrel body. |
-| crozebevel radius | radius at the crozebevel edge. |
-| head radius | radius of the flat head disc. |
-| volume | enclosed internal volume of the reconstructed barrel. |
-| sub-volume columns | any additional partitioned volume metrics emitted by the analysis step; these are carried through as extra columns in the summary CSV. |
+| **`01_synthetic_data.ipynb`** | Generate and inspect 3D synthetic barrels with realistic noise/artifacts. |
+| **`02_train_grid_denoiser.ipynb`** | Train and visualize the GridUNet 2D height-field denoiser. |
+| **`03_train_point_classifier.ipynb`** | Train the PointNet pre-binning floater/outlier classifier. |
+| **`04_evaluate_models.ipynb`** | Side-by-side metric comparison (Rules vs Learned) and fidelity reports. |
 
-The same measurements are also written into the per-file CSVs under the per_file directory.
+---
 
-## 5. Choosing rules vs. learned cleanup
+## ❓ 5. Troubleshooting & FAQ
 
-The current default is rule-based cleanup. It is the production path and is implemented directly in [barrel_reconstruct.py](../barrel_reconstruct.py).
-
-### Rules mode
-
-Use `--cleanup rules` when you want the most reliable, interpretable cleanup path. The rule-based pipeline explicitly preserves the crease/crozehead split and is robust on the crozehead region because it uses the wall/head split and corner-row packing.
-
-### Learned mode
-
-Use `--cleanup learned` when you want to try the newer learned path. The learned path is intended to improve robustness around the pole/head region and reduce the kind of cell-level corruption that can leak through the rule-based outlier handling. In the current repository it relies on the point-level classifier and grid denoiser modules, and it will fall back to rules if those components are unavailable or fail.
-
-### Side-by-side comparison
-
-Once the learned models are wired into the evaluation path, the intended comparison command is:
-
-```bash
-python barrel_eval.py --compare "C:/path/to/scan.obscan"
-```
-
-The current repository still uses the synthetic evaluation path as the ready-to-run baseline, so the practical comparison workflow is to run the rules and learned variants separately and compare the reported metrics.
-
-## 6. Training the learned models
-
-The training workflow is driven by the synthetic generator and the learned model scripts.
-
-### Generate synthetic data
-
-```bash
-python barrel_synth.py --test
-python barrel_synth.py --dump synthetic_barrel.npz
-```
-
-The first command produces a quick self-check; the second writes a compressed `.npz` dataset that can be reused by the training scripts.
-
-### Train the grid denoiser
-
-```bash
-python train_grid_denoiser.py --epochs 15 --batch-size 4
-```
-
-### Train the point classifier
-
-```bash
-python train_point_classifier.py --epochs 10
-```
-
-### Evaluate the metrics
-
-```bash
-python barrel_eval.py --synthetic --seed 42
-```
-
-The summary output reports:
-
-- `fidelity_rms_mm` — overall point-to-surface residual in millimetres.
-- `crozehead_rms_mm` — residual near the crozehead crease band.
-- `head_pole_rms_mm` — residual near the head/pole rows.
-- `asym_rms_mm` — departure from an ideal surface of revolution.
-- `gt_rms_mm` — synthetic-only RMS error versus the analytic ground-truth grid.
-
-## 7. Troubleshooting
-
-This repository does not currently ship a checked-in sample log bundle with the warning phrases from the original workflow notes, so the most actionable messages to watch are the ones emitted directly by the current scripts.
-
-- `PointNet pre-binning filter skipped: ...` or `GridUNet fallback to rules due to error: ...` — the learned path failed. This is usually benign if you are just testing the fallback path, but it is worth investigating if you expected the learned path to run and the model checkpoint is present.
-- `No files matching ...` from the batch runner — the input directory did not contain any files matching the provided glob. Check the path and `--pattern` value.
-- `--overlap auto` skipping overlap removal — expected on very large meshes above the configured face-count threshold. It is usually benign, but worth investigating if the mesh looks incorrectly self-intersecting or if the analysis output is unexpectedly poor.
-- If the Blender-side analysis emits warnings such as “head not found” or “mid-span exceeds bilge”, treat them as geometry-analysis warnings rather than fatal errors. They are usually a sign that the scan fit is ambiguous or the barrel shape is outside the expected range, so investigate them if they recur on many files or if the reconstructed mesh is obviously wrong.
+- **Volume seems inflated or wrong**: Check if `STL_UNITS_MM` in `barrel_reconstruct.py` matches your external tool expectations. Internal computations inside Python are strictly in **metres** and output volume is converted to **Litres** ($1 \text{ m}^3 = 1000 \text{ L}$).
+- **Central spike/spindle on the head**: The rule-based `flatten_head_poles()` prevents this by using flat-head secant law. Make sure `--no-despindle` was not passed in batch mode.
+- **Learned cleanup fallback**: If PyTorch model checkpoints (`models/*.pt`) are missing when running `--cleanup learned`, the script will print a warning and safely fall back to `--cleanup rules`.

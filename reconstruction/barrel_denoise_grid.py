@@ -22,7 +22,7 @@ import torch.nn.functional as F
 import numpy as np
 
 DEFAULT_CHECKPOINT = os.path.join(
-    os.path.dirname(__file__), "grid_denoiser_best.pt"
+    os.path.dirname(__file__), "..", "models", "grid_denoiser_best.pt"
 )
 
 
