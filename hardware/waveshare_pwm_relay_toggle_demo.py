@@ -42,13 +42,13 @@ DEPENDENCIES:
 
 USAGE:
   1. Verification / Pre-wiring check (reads address 0x4000 & firmware 0x8000):
-     python waveshare_pwm_relay_toggle_demo.py --verify --port COM3
+     python hardware/waveshare_pwm_relay_toggle_demo.py --verify --port COM3
 
   2. Relay ON/OFF toggle test (default): toggles channel 1 ON -> OFF -> ON -> OFF
-     python waveshare_pwm_relay_toggle_demo.py --port COM3
+     python hardware/waveshare_pwm_relay_toggle_demo.py --port COM3
 
   3. Custom hold time / number of toggles / channel:
-     python waveshare_pwm_relay_toggle_demo.py --port COM3 --channel 1 --hold 3 --cycles 4
+     python hardware/waveshare_pwm_relay_toggle_demo.py --port COM3 --channel 1 --hold 3 --cycles 4
 """
 
 import argparse
@@ -365,7 +365,7 @@ def main():
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUDRATE, help=f"Baud rate (default: {DEFAULT_BAUDRATE})")
     parser.add_argument("--slave-id", type=int, default=DEFAULT_SLAVE_ID, help=f"Slave device ID (default: {DEFAULT_SLAVE_ID})")
     parser.add_argument("--channel", type=int, default=DEFAULT_CHANNEL, choices=[1, 2, 3, 4], help="PWM Channel (1-4)")
-    parser.add_argument("--freq", type=float, default=DEFAULT_FREQUENCY_HZ, help=f"PWM Frequency in Hz (default: {DEFAULT_FREQUENCY_HZ}, irrelevant at 0/100% duty)")
+    parser.add_argument("--freq", type=float, default=DEFAULT_FREQUENCY_HZ, help=f"PWM Frequency in Hz (default: {DEFAULT_FREQUENCY_HZ}, irrelevant at 0/100%% duty)")
     parser.add_argument("--hold", type=float, default=DEFAULT_HOLD_SEC, help=f"Seconds to hold each ON/OFF state (default: {DEFAULT_HOLD_SEC})")
     parser.add_argument("--cycles", type=int, default=DEFAULT_CYCLES, help=f"Number of ON->OFF cycles to run (default: {DEFAULT_CYCLES})")
     parser.add_argument("--verify", action="store_true", help="Run pre-wiring test & verification procedure")
