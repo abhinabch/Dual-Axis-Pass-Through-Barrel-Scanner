@@ -159,6 +159,9 @@ def evaluate_grid(rho_pts, el_pts, az_pts, clean_grid, el_edges, n_az,
         rho_pts, el_pts, az_pts, clean_grid, el_edges, n_az, bad_mask)
     asym_rms_val, asym_max = asymmetry_rms(clean_grid)
 
+    # Mesh-level metrics (volume, area, watertightness)
+    # Note: these are computed in barrel_reconstruct.reconstruct_one and passed here
+    # if available via the calling harness.
     metrics = {
         "label": label,
         "fidelity_rms_mm": fid_rms * 1000,
@@ -281,6 +284,27 @@ def _eval_synthetic(seed=42, n_points=300_000):
     return metrics
 
 
+def _eval_compare(obscan_path):
+    """Compare rules vs learned cleanup on a real .obscan file."""
+    from barrel_reconstruct import reconstruct_one
+    print(f"Comparing rules vs learned cleanup on {obscan_path}...")
+
+    res_rules = reconstruct_one(obscan_path, cleanup_mode="rules")
+    res_learned = reconstruct_one(obscan_path, cleanup_mode="learned")
+
+    print("\n" + "=" * 65)
+    print("SIDE-BY-SIDE SUMMARY (rules vs learned)")
+    print("=" * 65)
+    print(f"  %-20s  %12s  %12s" % ("Metric", "Rules", "Learned"))
+    print("  " + "-" * 50)
+    print(f"  %-20s  %12.3f  %12.3f" % ("Volume (L)", res_rules["clean"]["vol_L"], res_learned["clean"]["vol_L"]))
+    print(f"  %-20s  %12.4f  %12.4f" % ("Surface Area (m²)", res_rules["clean"]["area"], res_learned["clean"]["area"]))
+    print(f"  %-20s  %12.2f  %12.2f" % ("Fidelity RMS (mm)", res_rules["fidelity_rms"], res_learned["fidelity_rms"]))
+    print(f"  %-20s  %12.2f  %12.2f" % ("Asymmetry RMS (mm)", res_rules["asym_rms"], res_learned["asym_rms"]))
+    print(f"  %-20s  %12d  %12d" % ("Bung Cells", res_rules["bung"], res_learned["bung"]))
+    print(f"  %-20s  %12s  %12s" % ("Watertight", str(res_rules["clean"]["watertight"]), str(res_learned["clean"]["watertight"])))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Barrel evaluation harness")
     parser.add_argument("--synthetic", action="store_true",
@@ -294,7 +318,7 @@ def main():
     if args.synthetic:
         _eval_synthetic(seed=args.seed, n_points=args.n_points)
     elif args.compare:
-        print("Comparison mode not yet implemented (needs Phase 2+3 models)")
+        _eval_compare(args.compare)
     else:
         parser.print_help()
 

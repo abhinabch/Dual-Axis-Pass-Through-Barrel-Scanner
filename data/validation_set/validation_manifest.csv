@@ -1,0 +1,3 @@
+barrel_id,obscan_file,nominal_size_L,gt_volume_L,gt_volume_uncertainty_L,gt_surface_area_m2,legacy_volume_L,legacy_source,barrel_condition,cooper,toast_level,capture_date,operator,ambient_temp_C,scan_notes,held_out
+B001_SAMPLE,sample_barrel_01.obscan,225.0,225.45,0.15,,227.10,barrel_batch_legacy.csv,used,Francois Freres,medium,2026-08-01,operator_1,20.5,sample validation record,FALSE
+B002_SAMPLE,sample_barrel_02.obscan,225.0,224.80,0.15,,226.50,barrel_batch_legacy.csv,new,World Cooperage,heavy,2026-08-01,operator_1,20.8,held out test barrel,TRUE
