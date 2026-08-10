@@ -553,18 +553,20 @@ def write_stl(path, verts, faces, scale=1.0):
 
 # ── Per-file reconstruction ────────────────────────────────────────────────────
 
-def out_path(tag, ext, stem):
+def out_path(tag, ext, stem, out_dir=None):
     """Full path for an output variant, creating its subfolder if needed."""
-    d = os.path.join(OUT_DIR, OUT_SUBDIRS[(tag, ext)])
+    base_dir = out_dir if out_dir is not None else OUT_DIR
+    d = os.path.join(base_dir, OUT_SUBDIRS[(tag, ext)])
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, "%s_barrel_%s.%s" % (stem, tag, ext))
 
 
-def reconstruct_one(src, cleanup_mode=None):
-    """Reconstruct one .obscan; write <stem>_barrel_clean/axisym.ply to OUT_DIR.
+def reconstruct_one(src, cleanup_mode=None, out_dir=None):
+    """Reconstruct one .obscan; write <stem>_barrel_clean/axisym.ply to OUT_DIR or custom out_dir.
     Returns a summary dict."""
     if cleanup_mode is None:
-        cleanup_mode = CLEANUP_MODE
+        cleanup_mode = CLEANUP_MODE    
+    # Use provided out_dir if available, otherwise fall back to global OUT_DIR    base_out = out_dir if out_dir is not None else OUT_DIR
 
     stem = os.path.splitext(os.path.basename(src))[0]
     print("\n" + "=" * 70)
@@ -683,13 +685,13 @@ def reconstruct_one(src, cleanup_mode=None):
         vol = abs(signed_volume(verts, faces))
         area = surface_area(verts, faces)
         nrm = vertex_normals(verts, faces)
-        path = out_path(tag, "ply", stem)
+        path = out_path(tag, "ply", stem, out_dir=base_out)
         write_ply(path, verts, faces, nrm)
-        out_names = os.path.relpath(path, OUT_DIR)
+        out_names = os.path.relpath(path, base_out)
         if WRITE_STL:
-            stl_path = out_path(tag, "stl", stem)
+            stl_path = out_path(tag, "stl", stem, out_dir=base_out)
             write_stl(stl_path, verts, faces, 1000.0 if STL_UNITS_MM else 1.0)
-            out_names += " + %s (%s)" % (os.path.relpath(stl_path, OUT_DIR),
+            out_names += " + %s (%s)" % (os.path.relpath(stl_path, base_out),
                                          "mm" if STL_UNITS_MM else "m")
         result[tag] = {"path": path, "v": len(verts), "f": len(faces),
                        "watertight": wt, "vol_L": vol * 1000.0, "area": area}
