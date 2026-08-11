@@ -561,6 +561,10 @@ def out_path(tag, ext, stem, out_dir=None):
     return os.path.join(d, "%s_barrel_%s.%s" % (stem, tag, ext))
 
 
+def run_reconstruction_pipeline(src, cleanup_mode=None, out_dir=None):
+    """Wrapper for reconstruct_one to be used as a pipeline entry point."""
+    return reconstruct_one(src, cleanup_mode=cleanup_mode, out_dir=out_dir)
+
 def reconstruct_one(src, cleanup_mode=None, out_dir=None):
     """Reconstruct one .obscan; write <stem>_barrel_clean/axisym.ply to OUT_DIR or custom out_dir.
     Returns a summary dict."""
