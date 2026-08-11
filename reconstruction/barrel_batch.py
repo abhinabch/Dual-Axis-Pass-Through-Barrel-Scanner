@@ -32,8 +32,13 @@ import time
 import numpy as np
 import trimesh
 
-import blender_stub
-blender_stub.install()          # must precede `import barrel_pipeline`
+# Attempt to import blender_stub, but make it optional for basic GUI startup
+try:
+    import blender_stub
+    blender_stub.install()          # must precede `import barrel_pipeline`
+except ImportError:
+    blender_stub = None
+    print("Warning: blender_stub not found. Some batch analysis features will be unavailable.")
 
 # barrel_pipeline.py is Blender code (it `import bpy`), reused here for its analysis
 # math behind the blender_stub shim.  After the repo was split into sibling
@@ -43,9 +48,15 @@ _BLENDER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".
 if os.path.isdir(_BLENDER_DIR) and _BLENDER_DIR not in sys.path:
     sys.path.insert(0, _BLENDER_DIR)
 
-import barrel_pipeline as bp     # noqa: E402  (imported after shim install + path)
-import barrel_clean              # noqa: E402
-from blender_stub import Vector, Matrix  # noqa: E402
+try:
+    import barrel_pipeline as bp     # noqa: E402  (imported after shim install + path)
+    import barrel_clean              # noqa: E402
+    from blender_stub import Vector, Matrix  # noqa: E402
+except ImportError:
+    bp = None
+    barrel_clean = None
+    Vector = Matrix = None
+    print("Warning: barrel_pipeline or barrel_clean not found. Batch analysis will be disabled.")
 
 
 # ── shim mesh object that `run_crozehead_analysis` can read ──────────────────────
@@ -135,6 +146,13 @@ def detect_scale(V, target=1.0):
         return 1.0
     return 10.0 ** round(math.log10(target / ext))
 
+
+def save_to_log(message, log_file=None):
+    """Generic logging helper used by the GUI."""
+    if log_file:
+        log_file.write(message + "\n")
+    else:
+        print(message)
 
 # ── per-file measurement / profile CSV parsing ───────────────────────────────
 def read_measurements(path):

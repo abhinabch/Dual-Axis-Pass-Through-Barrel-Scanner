@@ -29,6 +29,7 @@ import pyautogui
 import pygetwindow as gw
 from pymodbus.client import ModbusSerialClient
 from pymodbus.exceptions import ModbusException
+from typing import Callable, Optional
 
 # ---------------------------------------------------------------------------
 # Logging Setup
@@ -46,15 +47,20 @@ log = logging.getLogger("precision_scan")
 # Motor Comms Configuration
 SERIAL_PORT = "COM3"
 BAUDRATE = 115200
-UNIT_ID = 1
+UNIT_ID_PAN = 1
+UNIT_ID_TILT = 2
 TIMEOUT = 2
 
 # Motor Calibration & Tuning
-PULSES_PER_REV = 10000              # Number of steps per full 360-degree rotation
+PULSES_PER_REV_PAN = 10000              # Number of steps per full 360-degree rotation
+PULSES_PER_REV_TILT = 1000              # Pulses per rev for ESS17
 DEADBAND_STEPS = 10                 # Allowable step error to consider target reached
 TEST_VELOCITY_RPM = 30              # Speed of pan rotation
 TEST_ACCEL_MS_PER_1000RPM = 300     # Acceleration profile
 TEST_DECEL_MS_PER_1000RPM = 300     # Deceleration profile
+TILT_VELOCITY_RPM = 20              # Speed of tilt rotation
+TILT_ACCEL_MS = 200                 # Acceleration for tilt
+TILT_DECEL_MS = 200                 # Deceleration for tilt
 
 # Modbus Registers
 STATUS_REGISTER = 4099              # 0x1003 - Motion status bits
@@ -70,8 +76,17 @@ REG_TRIGGER = 0x6207                # Pr9.07 - Trigger path execution
 REG_ENCODER_H = 0x602C              # Pr8.44 - Actual Encoder Feedback (High)
 REG_ENCODER_L = 0x602D              # Pr8.45 - Actual Encoder Feedback (Low)
 
+# Tilt-axis specific registers (ESS-RS Series)
+TILT_STATUS_REG = 0x0007
+TILT_ERROR_REG = 0x0006
+TILT_REG_VELOCITY = 0x0023
+TILT_REG_POS_H = 0x0024
+TILT_REG_POS_L = 0x0025
+TILT_REG_CONTROL = 0x0027
+
 # Control mode settings
 CONTROL_WORD_ABSOLUTE_POSITION_MOVE = 0x0001  # Bit0=1 (Position), Bit6=0 (Absolute)
+TILT_START_RELATIVE_MOVE = 0x0001
 
 # GUI Automation Settings
 WINDOW_TITLE_SUBSTRING = "CrealityScan"
@@ -99,13 +114,16 @@ except AttributeError:
 class AutomationError(RuntimeError):
     """Raised when a GUI automation check fails."""
 
+class PipelineError(Exception):
+    """Raised for general pipeline failures that should trigger the Error screen."""
+
 # ---------------------------------------------------------------------------
 # Modbus / Motor Controls
 # ---------------------------------------------------------------------------
 
-def read_encoder_position(client: ModbusSerialClient) -> int:
+def read_encoder_position(client: ModbusSerialClient, unit_id: int) -> int:
     """Reads 32-bit signed feedback position from registers 0x602C and 0x602D."""
-    result = client.read_holding_registers(address=REG_ENCODER_H, count=2, device_id=UNIT_ID)
+    result = client.read_holding_registers(address=REG_ENCODER_H, count=2, device_id=unit_id)
     if result.isError():
         raise ModbusException(f"Failed to read encoder registers: {result}")
     
@@ -127,55 +145,124 @@ def decode_status(word: int) -> dict:
         "enabled": bool(word & (1 << 1)),
     }
 
-def read_motor_status(client: ModbusSerialClient) -> dict:
+def read_motor_status(client: ModbusSerialClient, unit_id: int) -> dict:
     """Queries current motion state bitmask."""
-    result = client.read_holding_registers(address=STATUS_REGISTER, count=1, device_id=UNIT_ID)
+    result = client.read_holding_registers(address=STATUS_REGISTER, count=1, device_id=unit_id)
     if result.isError():
         raise ModbusException(f"Failed to read status register: {result}")
     return decode_status(result.registers[0])
 
-def check_motor_alarm(client: ModbusSerialClient) -> int:
+def check_motor_alarm(client: ModbusSerialClient, unit_id: int) -> int:
     """Queries current alarm code. Returns 0 if healthy."""
-    result = client.read_holding_registers(address=ALARM_REGISTER, count=1, device_id=UNIT_ID)
+    result = client.read_holding_registers(address=ALARM_REGISTER, count=1, device_id=unit_id)
     if result.isError():
         raise ModbusException(f"Failed to read alarm register: {result}")
     return result.registers[0]
 
-def send_absolute_move(client: ModbusSerialClient, target_pos: int):
+def send_absolute_move(client: ModbusSerialClient, unit_id: int, target_pos: int):
     """Programs and triggers an absolute move command to target_pos."""
-    pos_val = int(target_pos) & 0xFFFFFFFF
-    pos_h = (pos_val >> 16) & 0xFFFF
-    pos_l = pos_val & 0xFFFF
-    
-    # 1. Set mode to absolute positioning
-    result = client.write_registers(address=REG_CONTROL_WORD, values=[CONTROL_WORD_ABSOLUTE_POSITION_MOVE], device_id=UNIT_ID)
-    if result.isError():
-        raise ModbusException(f"Failed to set absolute move control word: {result}")
+    if unit_id == UNIT_ID_TILT:
+        # ESS-RS specific move logic
+        pos_val = int(target_pos) & 0xFFFFFFFF
+        pos_h = (pos_val >> 16) & 0xFFFF
+        pos_l = pos_val & 0xFFFF
         
-    # 2. Set motion profile parameters
-    result = client.write_registers(address=REG_POSITION_H, values=[
-        pos_h,
-        pos_l,
-        TEST_VELOCITY_RPM,
-        TEST_ACCEL_MS_PER_1000RPM,
-        TEST_DECEL_MS_PER_1000RPM,
-        0  # Pause time
-    ], device_id=UNIT_ID)
-    if result.isError():
-        raise ModbusException(f"Failed to write motion parameters: {result}")
+        # Set velocity and accel for tilt
+        client.write_registers(address=TILT_REG_VELOCITY, values=[TILT_VELOCITY_RPM], device_id=unit_id)
+        client.write_registers(address=TILT_REG_ACCEL if 'TILT_REG_ACCEL' in globals() else 0x0021, values=[TILT_ACCEL_MS], device_id=unit_id)
+        client.write_registers(address=TILT_REG_DECEL if 'TILT_REG_DECEL' in globals() else 0x0022, values=[TILT_DECEL_MS], device_id=unit_id)
         
-    # 3. Trigger immediate execution of Path 0
-    result = client.write_registers(address=REG_TRIGGER, values=[0x0010], device_id=UNIT_ID)
-    if result.isError():
-        raise ModbusException(f"Trigger command failed: {result}")
+        # Set position
+        client.write_registers(address=TILT_REG_POS_H, values=[pos_h, pos_l], device_id=unit_id)
+        # Trigger move
+        client.write_registers(address=TILT_REG_CONTROL, values=[TILT_START_RELATIVE_MOVE], device_id=unit_id)
+    else:
+        # iDM57-RS specific move logic
+        pos_val = int(target_pos) & 0xFFFFFFFF
+        pos_h = (pos_val >> 16) & 0xFFFF
+        pos_l = pos_val & 0xFFFF
+        
+        # 1. Set mode to absolute positioning
+        result = client.write_registers(address=REG_CONTROL_WORD, values=[CONTROL_WORD_ABSOLUTE_POSITION_MOVE], device_id=unit_id)
+        if result.isError():
+            raise ModbusException(f"Failed to set absolute move control word: {result}")
+            
+        # 2. Set motion profile parameters
+        result = client.write_registers(address=REG_POSITION_H, values=[
+            pos_h,
+            pos_l,
+            TEST_VELOCITY_RPM,
+            TEST_ACCEL_MS_PER_1000RPM,
+            TEST_DECEL_MS_PER_1000RPM,
+            0  # Pause time
+        ], device_id=unit_id)
+        if result.isError():
+            raise ModbusException(f"Failed to write motion parameters: {result}")
+            
+        # 3. Trigger immediate execution of Path 0
+        result = client.write_registers(address=REG_TRIGGER, values=[0x0010], device_id=unit_id)
+        if result.isError():
+            raise ModbusException(f"Trigger command failed: {result}")
 
 def emergency_stop(client: ModbusSerialClient):
     """Commands E-stop (write 0x0040 to trigger register) to instantly halt motor."""
     log.warning("EMERGENCY STOP COMMAND SENT TO MOTOR")
     try:
-        client.write_registers(address=0x6002, values=[0x0040], device_id=UNIT_ID)
+        # Pan axis E-stop
+        client.write_registers(address=0x6002, values=[0x0040], device_id=UNIT_ID_PAN)
+        # Tilt axis (ESS-RS typically uses a different stop command, 
+        # but often writing 0 to movement control or a specific stop reg works)
+        client.write_registers(address=TILT_REG_CONTROL, values=[0x0000], device_id=UNIT_ID_TILT)
     except Exception as e:
         log.error("Failed to execute hardware emergency stop: %s", e)
+
+class SafetyWatchdog:
+    """
+    Background thread that polls motor positions and alarms to detect stalls or faults.
+    If a fault is detected, it calls the provided callback to trigger the Error screen.
+    """
+    def __init__(self, client: ModbusSerialClient, callback: Callable[[], None], poll_interval: float = 0.5):
+        self.client = client
+        self.callback = callback
+        self.poll_interval = poll_interval
+        self._running = False
+        self._stop_event = None
+
+    def start(self):
+        import threading
+        self._running = True
+        self._stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        log.info("SafetyWatchdog started.")
+
+    def stop(self):
+        self._running = False
+        if self._stop_event:
+            self._stop_event().set()
+        log.info("SafetyWatchdog stopped.")
+
+    def _run(self):
+        while self._running:
+            try:
+                # Check Pan Axis
+                pan_status = read_motor_status(self.client, UNIT_ID_PAN)
+                if pan_status["faulty"]:
+                    log.error("SafetyWatchdog: Pan axis fault detected!")
+                    self.callback()
+                    break
+                
+                # Check Tilt Axis
+                tilt_status = read_motor_status(self.client, UNIT_ID_TILT)
+                if tilt_status["faulty"]:
+                    log.error("SafetyWatchdog: Tilt axis fault detected!")
+                    self.callback()
+                    break
+                
+            except Exception as e:
+                log.warning("SafetyWatchdog poll error: %s", e)
+            
+            time.sleep(self.poll_interval)
 
 # ---------------------------------------------------------------------------
 # Creality GUI Automation
@@ -268,6 +355,99 @@ def run_scan_stop_sequence(dry_run: bool):
     except Exception as e:
         log.error("Failed to click stop/complete button: %s. Please stop scan manually.", e)
 
+def export_scan_file(src_path: str, dst_path: str):
+    """
+    Handles the manual file movement from Creality's default save location 
+    to the pipeline's processed directory. 
+    
+    NOTE: Creality Scan's save path is typically user-defined or in a 
+    specific AppData folder. This function assumes the file has been 
+    successfully saved to `src_path`.
+    """
+    import shutil
+    log.info("Exporting scan file from %s to %s", src_path, dst_path)
+    try:
+        shutil.copy2(src_path, dst_path)
+        log.info("Scan file exported successfully.")
+        return True
+    except Exception as e:
+        log.error("Failed to export scan file: %s", e)
+        raise PipelineError(f"Scan export failed: {e}")
+
+def perform_raster_sweep(client: ModbusSerialClient, dry_run: bool, progress_callback: Optional[Callable[[str], None]] = None):
+    """
+    Executes a full raster sweep of the barrel interior.
+    Toggles between pan and tilt moves to cover the internal surface.
+    """
+    def report(msg):
+        if progress_callback:
+            progress_callback(msg)
+        log.info(msg)
+
+    # 1. Pre-flight Checks
+    alarm_pan = check_motor_alarm(client, UNIT_ID_PAN)
+    alarm_tilt = check_motor_alarm(client, UNIT_ID_TILT)
+    if alarm_pan != 0 or alarm_tilt != 0:
+        raise PipelineError(f"Motor fault detected! Pan: {alarm_pan}, Tilt: {alarm_tilt}")
+        
+    status_pan = read_motor_status(client, UNIT_ID_PAN)
+    status_tilt = read_motor_status(client, UNIT_ID_TILT)
+    if not status_pan["enabled"] or not status_tilt["enabled"]:
+        raise PipelineError("One or more motor drivers are disabled.")
+
+    # 2. Establish References
+    start_pos_pan = read_encoder_position(client, UNIT_ID_PAN)
+    start_pos_tilt = read_encoder_position(client, UNIT_ID_TILT)
+    
+    # Define a simple raster pattern (e.g., 3 tilt levels, each with a pan sweep)
+    # In a real scenario, these would be calibrated based on barrel height
+    tilt_levels = [0, 1000, -1000] # Relative steps for tilt
+    pan_targets = [start_pos_pan + (PULSES_PER_REV_PAN // 2), start_pos_pan] # Simple 180 deg sweep
+
+    # 3. Initiate Scanner
+    run_scan_start_sequence(dry_run)
+    time.sleep(1.0)
+
+    try:
+        for i, tilt_offset in enumerate(tilt_levels):
+            report(f"Positioning tilt axis - Pass {i+1}/{len(tilt_levels)}...")
+            
+            # Move Tilt
+            send_absolute_move(client, UNIT_ID_TILT, start_pos_tilt + tilt_offset)
+            # Wait for tilt to settle (simplification: fixed wait or poll status)
+            time.sleep(2.0) 
+            
+            for j, pan_target in enumerate(pan_targets):
+                report(f"Scanning Pass {i+1}, Row {j+1}...")
+                send_absolute_move(client, UNIT_ID_PAN, pan_target)
+                
+                # Monitor pan movement
+                move_start = time.time()
+                while True:
+                    if time.time() - move_start > 30:
+                        raise TimeoutError("Pan move timed out")
+                    
+                    pos = read_encoder_position(client, UNIT_ID_PAN)
+                    state = read_motor_status(client, UNIT_ID_PAN)
+                    if abs(pos - pan_target) <= DEADBAND_STEPS and not state["running"]:
+                        break
+                    
+                    if not dry_run:
+                        check_and_handle_warning()
+                    time.sleep(0.1)
+        
+        # Return to Home
+        report("Returning to home position...")
+        send_absolute_move(client, UNIT_ID_TILT, start_pos_tilt)
+        send_absolute_move(client, UNIT_ID_PAN, start_pos_pan)
+        time.sleep(2.0)
+
+    except Exception as e:
+        emergency_stop(client)
+        raise e
+    finally:
+        run_scan_stop_sequence(dry_run)
+
 # ---------------------------------------------------------------------------
 # Coordinated Control Loop
 # ---------------------------------------------------------------------------
@@ -289,11 +469,11 @@ def execute_scan_motion(client: ModbusSerialClient, dry_run: bool):
         return
 
     # 2. Establish Starting Position (Treat as reference 0)
-    start_pos = read_encoder_position(client)
+    start_pos = read_encoder_position(client, UNIT_ID_PAN)
     log.info("Established starting reference encoder position: %d", start_pos)
 
     # 3. Calculate absolute targets
-    target_180_steps = PULSES_PER_REV // 2
+    target_180_steps = PULSES_PER_REV_PAN // 2
     targets = [
         ("Go to +180°", start_pos + target_180_steps),
         ("Go to 0°", start_pos),
@@ -309,7 +489,7 @@ def execute_scan_motion(client: ModbusSerialClient, dry_run: bool):
     try:
         for name, target_pos in targets:
             log.info("--- Executing Command: %s (Target: %d steps) ---", name, target_pos)
-            send_absolute_move(client, target_pos)
+            send_absolute_move(client, UNIT_ID_PAN, target_pos)
             
             # Monitoring loop for this movement segment
             last_warning_check = 0.0
@@ -325,11 +505,11 @@ def execute_scan_motion(client: ModbusSerialClient, dry_run: bool):
                     last_warning_check = current_time
                 
                 # Read hardware feedback
-                encoder_pos = read_encoder_position(client)
-                motor_state = read_motor_status(client)
+                encoder_pos = read_encoder_position(client, UNIT_ID_PAN)
+                motor_state = read_motor_status(client, UNIT_ID_PAN)
                 
                 # Check for faults during motion
-                if motor_state["faulty"] or check_motor_alarm(client) != 0:
+                if motor_state["faulty"] or check_motor_alarm(client, UNIT_ID_PAN) != 0:
                     raise RuntimeError("Motor driver faulted during movement segment!")
                     
                 diff = abs(encoder_pos - target_pos)
@@ -339,8 +519,8 @@ def execute_scan_motion(client: ModbusSerialClient, dry_run: bool):
                 # Settle condition: Encoder feedback is close to target and motor stopped running
                 if diff <= DEADBAND_STEPS:
                     time.sleep(0.2)  # Settle time
-                    final_pos = read_encoder_position(client)
-                    final_state = read_motor_status(client)
+                    final_pos = read_encoder_position(client, UNIT_ID_PAN)
+                    final_state = read_motor_status(client, UNIT_ID_PAN)
                     if abs(final_pos - target_pos) <= DEADBAND_STEPS and not final_state["running"]:
                         log.info("Target reached and settled successfully at %d", final_pos)
                         break
