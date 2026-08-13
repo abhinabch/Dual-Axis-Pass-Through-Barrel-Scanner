@@ -584,10 +584,54 @@ class AppGUI(ctk.CTk):
     def poll_connections(self):
         """Periodically check connection status of turret and scanner."""
         log.info("Polling connections...")
-        # Simulation of connectivity check
-        self.conn_indicator.configure(text="● Turret: Connected", text_color="green")
-        self.scanner_indicator.configure(text="● Scanner: Connected", text_color="green")
-        self.ready_indicator.configure(text="● Ready to Scan: YES", text_color="green")
+        
+        # 1. Check Turret Connectivity (Modbus)
+        turret_ok = False
+        try:
+            if self.client is None:
+                # Try to initialize client if it doesn't exist
+                self.client = ModbusSerialClient(port=SERIAL_PORT, baudrate=BAUDRATE, timeout=TIMEOUT)
+                self.client.connect()
+            
+            if self.client.connected:
+                # Try to read a status register to verify actual communication
+                status = read_motor_status(self.client, UNIT_ID_PAN)
+                if status is not None:
+                    turret_ok = True
+        except Exception as e:
+            log.debug("Turret poll failed: %s", e)
+
+        # 2. Check Scanner Connectivity
+        # (Assuming scanner has a similar check or a mock for now since no specific scanner API provided)
+        scanner_ok = False 
+        try:
+            # Placeholder: In reality, this would check if the .obscan writer is reachable
+            # For now, we simulate a failure if no client is connected
+            if turret_ok: 
+                scanner_ok = True 
+        except Exception as e:
+            log.debug("Scanner poll failed: %s", e)
+
+        # Update UI
+        self.conn_indicator.configure(
+            text="● Turret: Connected" if turret_ok else "● Turret: Disconnected", 
+            text_color="green" if turret_ok else "red"
+        )
+        self.scanner_indicator.configure(
+            text="● Scanner: Connected" if scanner_ok else "● Scanner: Disconnected", 
+            text_color="green" if scanner_ok else "red"
+        )
+        
+        # 3. Check Overall Readiness
+        ready_ok = turret_ok and scanner_ok
+        self.ready_indicator.configure(
+            text="● Ready to Scan: YES" if ready_ok else "● Ready to Scan: NO", 
+            text_color="green" if ready_ok else "red"
+        )
+        
+        # Update Start Button state
+        if hasattr(self, 'start_btn'):
+            self.start_btn.configure(state="normal" if ready_ok else "disabled")
         
         # Schedule next poll in 5 seconds
         self.after(5000, self.poll_connections)
