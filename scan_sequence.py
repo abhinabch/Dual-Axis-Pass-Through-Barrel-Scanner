@@ -50,7 +50,7 @@ class ModbusLink:
             parity='N',
             stopbits=1,
             bytesize=8,
-            timeout=1
+            timeout=2.0
         )
 
     def connect(self):
@@ -64,16 +64,17 @@ class ModbusLink:
         self.client.close()
         logger.info("Disconnected from Modbus device")
 
+    def ensure_connected(self):
+        """Re-establishes connection if pymodbus closed port after transient errors."""
+        if hasattr(self.client, "connected") and not self.client.connected:
+            logger.warning("Modbus connection was closed by driver. Re-connecting...")
+            self.client.connect()
+
     def read_reg(self, slave_id, address):
+        self.ensure_connected()
+        time.sleep(0.01)
         try:
-            try:
-                result = self.client.read_holding_registers(address, count=1, device_id=slave_id)
-            except TypeError:
-                try:
-                    result = self.client.read_holding_registers(address, count=1, slave=slave_id)
-                except TypeError:
-                    result = self.client.read_holding_registers(address, count=1, unit=slave_id)
-                    
+            result = self.client.read_holding_registers(address, count=1, device_id=slave_id)
             if result is None or result.isError():
                 logger.error(f"Modbus Error reading register {hex(address)} from Slave {slave_id}: {result}")
                 return None
@@ -83,15 +84,10 @@ class ModbusLink:
             return None
 
     def write_reg(self, slave_id, address, value):
+        self.ensure_connected()
+        time.sleep(0.01)
         try:
-            try:
-                result = self.client.write_register(address, value, device_id=slave_id)
-            except TypeError:
-                try:
-                    result = self.client.write_register(address, value, slave=slave_id)
-                except TypeError:
-                    result = self.client.write_register(address, value, unit=slave_id)
-
+            result = self.client.write_register(address, value, device_id=slave_id)
             if result is None or result.isError():
                 logger.error(f"Modbus Error writing register {hex(address)} to Slave {slave_id}: {result}")
                 return False
@@ -101,15 +97,10 @@ class ModbusLink:
             return False
 
     def write_regs(self, slave_id, address, values):
+        self.ensure_connected()
+        time.sleep(0.01)
         try:
-            try:
-                result = self.client.write_registers(address, values, device_id=slave_id)
-            except TypeError:
-                try:
-                    result = self.client.write_registers(address, values, slave=slave_id)
-                except TypeError:
-                    result = self.client.write_registers(address, values, unit=slave_id)
-
+            result = self.client.write_registers(address, values, device_id=slave_id)
             if result is None or result.isError():
                 logger.error(f"Modbus Error writing registers from {hex(address)} to Slave {slave_id}: {result}")
                 return False

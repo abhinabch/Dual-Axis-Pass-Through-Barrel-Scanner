@@ -20,9 +20,10 @@ from hardware.run_precision_scan import (
     check_motor_alarm,
     emergency_stop,
     SafetyWatchdog,
-    perform_raster_sweep,
+    # perform_raster_sweep, # Removed in favor of scan_sequence
     PipelineError
 )
+from scan_sequence import run_scan_sequence, ModbusLink
 from reconstruction.barrel_reconstruct import run_reconstruction_pipeline # Assumed entry point
 from reconstruction.barrel_batch import save_to_log # Assumed entry point
 
@@ -73,7 +74,7 @@ class AppGUI(ctk.CTk):
         self.status_bar = ctk.CTkFrame(self, height=40, corner_radius=0)
         self.status_bar.grid(row=0, column=0, sticky="ew")
         
-        self.conn_indicator = ctk.CTkLabel(self.status_bar, text="● Turret: Disconnected", text_color="red")
+        self.conn_indicator = ctk.CTkLabel(self.status_bar, text="● Motors: Disconnected", text_color="red")
         self.conn_indicator.pack(side="left", padx=20)
         
         self.scanner_indicator = ctk.CTkLabel(self.status_bar, text="● Scanner: Disconnected", text_color="red")
@@ -192,8 +193,13 @@ class AppGUI(ctk.CTk):
         frame = ctk.CTkFrame(self.main_container)
         frame.grid_columnconfigure(0, weight=1)
         
+        # Back Button
+        back_btn = ctk.CTkButton(frame, text="← Back", width=60, fg_color="transparent", border_width=1, 
+                                 command=lambda: self.show_frame(AppState.READY))
+        back_btn.pack(anchor="nw", padx=20, pady=20)
+        
         title_lbl = ctk.CTkLabel(frame, text="Scanning in Progress", font=("Roboto", 32, "bold"))
-        title_lbl.pack(pady=(40, 20))
+        title_lbl.pack(pady=(0, 20))
 
         # Progress Area
         prog_container = ctk.CTkFrame(frame, fg_color="transparent")
@@ -226,8 +232,13 @@ class AppGUI(ctk.CTk):
         frame = ctk.CTkFrame(self.main_container)
         frame.grid_columnconfigure(0, weight=1)
         
+        # Back Button
+        back_btn = ctk.CTkButton(frame, text="← Back", width=60, fg_color="transparent", border_width=1, 
+                                 command=lambda: self.show_frame(AppState.SCANNING))
+        back_btn.pack(anchor="nw", padx=20, pady=20)
+        
         title_lbl = ctk.CTkLabel(frame, text="Processing Scan Data", font=("Roboto", 32, "bold"))
-        title_lbl.pack(pady=(40, 20))
+        title_lbl.pack(pady=(0, 20))
 
         # Phase Text
         self.proc_phase_lbl = ctk.CTkLabel(frame, text="Loading scan data...", font=("Roboto", 18))
@@ -250,8 +261,13 @@ class AppGUI(ctk.CTk):
         frame = ctk.CTkFrame(self.main_container)
         frame.grid_columnconfigure(0, weight=1)
         
+        # Back Button
+        back_btn = ctk.CTkButton(frame, text="← Back", width=60, fg_color="transparent", border_width=1, 
+                                 command=lambda: self.show_frame(AppState.PROCESSING))
+        back_btn.pack(anchor="nw", padx=20, pady=20)
+        
         title_lbl = ctk.CTkLabel(frame, text="Measurement Results", font=("Roboto", 32, "bold"))
-        title_lbl.pack(pady=(40, 20))
+        title_lbl.pack(pady=(0, 20))
 
         # Main Results Grid
         res_grid = ctk.CTkFrame(frame, fg_color="transparent")
@@ -460,14 +476,15 @@ class AppGUI(ctk.CTk):
             self.start_time = time.time()
             self.update_timer_loop()
 
-            # Execute the raster sweep
-            perform_raster_sweep(self.client, dry_run=False, progress_callback=progress_cb)
+            # Execute the raster sweep using scan_sequence.py
+            # We use the link already established in the GUI
+            run_scan_sequence(self.client, progress_callback=progress_cb)
             
             # 2. Processing Phase
             self.worker_queue.put(WorkerMessage('status', data='processing'))
             self.after(0, lambda: self.show_frame(AppState.PROCESSING))
             
-            # In a real scenario, we'd get the file path from the automation logic
+            # Connect to the Creality save folder
             scan_file_path = "C:/raw barrel/resources.obscan" 
             
             # Simulation of reconstruction pipeline
