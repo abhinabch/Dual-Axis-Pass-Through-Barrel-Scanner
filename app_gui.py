@@ -26,6 +26,7 @@ from hardware.run_precision_scan import (
 from scan_sequence import run_scan_sequence, ModbusLink
 from reconstruction.barrel_reconstruct import run_reconstruction_pipeline # Assumed entry point
 from reconstruction.barrel_batch import save_to_log # Assumed entry point
+from hardware.creality_autostart import CrealityAutomator, AutomationError
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -59,6 +60,7 @@ class AppGUI(ctk.CTk):
         self._app_state = AppState.READY
         self.client: Optional[ModbusSerialClient] = None
         self.watchdog: Optional[SafetyWatchdog] = None
+        self.automator = CrealityAutomator()
         self.worker_queue = queue.Queue()
         self.stop_event = threading.Event()
 
@@ -442,8 +444,13 @@ class AppGUI(ctk.CTk):
         log.info("Controlled stop requested.")
         # Signal the worker thread to stop
         self.stop_event.set()
-        # In a real app, we would show a dialog here to ask "Save or Discard"
-        # For now, we'll trigger the error frame as a fallback
+        
+        # Stop Creality scanner process
+        try:
+            threading.Thread(target=self.automator.stop_scan, daemon=True).start()
+        except Exception as e:
+            log.warning("Failed to stop Creality Scan software: %s", e)
+
         self.show_frame(AppState.ERROR)
         self.error_title.configure(text="Scan Halted")
         self.error_msg.configure(text="The scan was stopped by the operator. Please decide whether to save the partial data in the technician panel.")
@@ -476,16 +483,36 @@ class AppGUI(ctk.CTk):
             self.start_time = time.time()
             self.update_timer_loop()
 
+            # Trigger Creality Scan autostart sequence
+            log.info("Triggering Creality Scan autostart sequence...")
+            try:
+                self.automator.start_scan()
+            except Exception as scan_err:
+                log.warning("Creality Scan autostart note: %s", scan_err)
+
             # Execute the raster sweep using scan_sequence.py
             # We use the link already established in the GUI
             run_scan_sequence(self.client, progress_callback=progress_cb)
             
+            # Stop scan in scanner UI
+            try:
+                self.automator.stop_scan()
+            except Exception as stop_err:
+                log.warning("Creality Scan stop note: %s", stop_err)
+
             # 2. Processing Phase
             self.worker_queue.put(WorkerMessage('status', data='processing'))
             self.after(0, lambda: self.show_frame(AppState.PROCESSING))
             
-            # Connect to the Creality save folder
-            scan_file_path = "C:/raw barrel/resources.obscan" 
+            # Export scan file via CrealityAutomator
+            barrel_id_str = self.barrel_id.get().strip() if self.barrel_id.get() else "default"
+            try:
+                scan_file_path = self.automator.export_scan(barrel_id=barrel_id_str)
+            except Exception as exp_err:
+                log.warning("Creality export fallback: %s", exp_err)
+                scan_file_path = "saved_creality_files/fallback.obscan"
+
+            log.info("Scan output recorded at: %s", scan_file_path)
             
             # Simulation of reconstruction pipeline
             # results = run_reconstruction_pipeline(scan_file_path)
@@ -619,12 +646,9 @@ class AppGUI(ctk.CTk):
             log.debug("Turret poll failed: %s", e)
 
         # 2. Check Scanner Connectivity
-        # (Assuming scanner has a similar check or a mock for now since no specific scanner API provided)
         scanner_ok = False 
         try:
-            # Placeholder: In reality, this would check if the .obscan writer is reachable
-            # For now, we simulate a failure if no client is connected
-            if turret_ok: 
+            if self.automator.is_window_available(): 
                 scanner_ok = True 
         except Exception as e:
             log.debug("Scanner poll failed: %s", e)
