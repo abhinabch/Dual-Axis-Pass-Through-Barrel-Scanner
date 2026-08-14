@@ -90,6 +90,11 @@ class CrealityAutomator:
         self.last_export_path: Optional[str] = None
 
         os.makedirs(self.save_dir, exist_ok=True)
+        # Debug output folder (repo_root/debug)
+        self.debug_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "debug")
+        )
+        os.makedirs(self.debug_dir, exist_ok=True)
 
     def is_window_available(self) -> bool:
         """Check if Creality Scan window is currently open."""
@@ -170,6 +175,63 @@ class CrealityAutomator:
         # Fallback to direct path in base dir
         return os.path.join(self.template_base_dir, template_name)
 
+    def capture_template_from_screen(self, template_name: str) -> Optional[str]:
+        """Capture a candidate template from the current screen and save it to the
+        active resolution folder (and debug folder). Returns the saved path or None.
+
+        The capture crops a top-centered band of the screen where the ready banner
+        typically appears; sizes are clamped to the current screen size.
+        """
+        try:
+            img = pyautogui.screenshot()
+            w, h = img.size
+
+            # Heuristic crop: top-centered horizontal band
+            crop_w = min(900, max(200, int(w * 0.7)))
+            crop_h = min(200, max(40, int(h * 0.18)))
+            crop_x = max(0, (w - crop_w) // 2)
+            crop_y = max(0, int(h * 0.08))
+
+            crop = img.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
+
+            # Decide target folder
+            target_folder = self.active_resolution_folder or self.template_base_dir
+            os.makedirs(target_folder, exist_ok=True)
+            target_path = os.path.join(target_folder, template_name)
+
+            crop.save(target_path)
+
+            # Also save into debug for inspection
+            dbg_name = f"auto_capture_{template_name.replace('.','_')}_{int(time.time())}.png"
+            dbg_path = os.path.join(self.debug_dir, dbg_name)
+            crop.save(dbg_path)
+
+            log.info("Auto-captured template saved to %s (debug: %s)", target_path, dbg_path)
+            return target_path
+        except Exception as e:
+            log.debug("Auto-capture failed: %s", e)
+            return None
+
+    def _ocr_contains_keywords(self, image, keywords=("start", "please", "ready")) -> bool:
+        """Optional OCR-based check for words in the screenshot. Returns True if any keyword found."""
+        try:
+            import pytesseract
+        except Exception:
+            log.debug("pytesseract not available; skipping OCR fallback")
+            return False
+
+        try:
+            text = pytesseract.image_to_string(image).lower()
+            for kw in keywords:
+                if kw in text:
+                    log.info("OCR found keyword '%s' in screen text", kw)
+                    return True
+            log.debug("OCR text: %s", text.strip()[:200])
+            return False
+        except Exception as e:
+            log.debug("OCR check failed: %s", e)
+            return False
+
     def wait_for_and_click(
         self,
         template_name: str,
@@ -194,9 +256,21 @@ class CrealityAutomator:
                 return location
             time.sleep(self.poll_interval)
 
+        # Save a debug screenshot to help diagnose template-match failures
+        dbg_path = None
+        try:
+            dbg_path = os.path.join(
+                self.debug_dir, f"timeout_wait_for_and_click_{label}_{int(time.time())}.png"
+            )
+            pyautogui.screenshot(dbg_path)
+            log.error("Saved debug screenshot to %s", dbg_path)
+        except Exception as e:
+            log.debug("Failed to save debug screenshot: %s", e)
+
         raise AutomationError(
             f"Timed out after {timeout}s waiting for '{label}' button. "
             f"Template searched: {template_path}. "
+            f"Debug screenshot: {dbg_path}. "
             "Verify display scaling, resolution, or window occlusion."
         )
 
@@ -211,20 +285,81 @@ class CrealityAutomator:
         timeout = timeout if timeout is not None else self.click_timeout
         conf = confidence if confidence is not None else self.confidence
         template_path = self.resolve_template(template_name)
-
         log.info("Waiting for '%s' (%s, timeout %.0fs)...", label, template_name, timeout)
         deadline = time.time() + timeout
 
+        # Try multiple confidences and grayscale options to be more tolerant
+        confidences_to_try = [conf, 0.8, 0.75, 0.7]
+
         while time.time() < deadline:
-            location = pyautogui.locateCenterOnScreen(template_path, confidence=conf)
-            if location is not None:
-                log.info("Detected '%s' at %s", label, location)
-                return location
+            for conf_try in confidences_to_try:
+                for grayscale in (False, True):
+                    try:
+                        location = pyautogui.locateCenterOnScreen(
+                            template_path, confidence=conf_try, grayscale=grayscale
+                        )
+                    except Exception:
+                        location = None
+
+                    if location is not None:
+                        log.info(
+                            "Detected '%s' at %s (confidence=%.2f, grayscale=%s)",
+                            label,
+                            location,
+                            conf_try,
+                            grayscale,
+                        )
+                        return location
             time.sleep(self.poll_interval)
+
+        # Save a debug screenshot to help diagnose template-match failures
+        dbg_path = None
+        try:
+            dbg_path = os.path.join(
+                self.debug_dir, f"timeout_wait_for_element_{label}_{int(time.time())}.png"
+            )
+            full = pyautogui.screenshot()
+            full.save(dbg_path)
+            log.error("Saved debug screenshot to %s", dbg_path)
+        except Exception as e:
+            full = None
+            log.debug("Failed to save debug screenshot: %s", e)
+
+        # C: Try auto-capturing a template from current screen into the active template folder
+        try:
+            saved = self.capture_template_from_screen(template_name)
+            if saved:
+                # Give the system a moment to settle and then try matching the newly captured template
+                time.sleep(0.5)
+                try_conf = min(0.8, conf)
+                for grayscale in (False, True):
+                    try:
+                        loc = pyautogui.locateCenterOnScreen(saved, confidence=try_conf, grayscale=grayscale)
+                    except Exception:
+                        loc = None
+                    if loc is not None:
+                        log.info("Auto-captured template matched at %s", loc)
+                        return loc
+                log.info("Auto-captured template did not match immediately; inspect %s", saved)
+        except Exception as e:
+            log.debug("Auto-capture attempt failed: %s", e)
+
+        # B (fallback): Try OCR on the debug screenshot to detect keywords like 'Start' or 'Please'
+        try:
+            if full is None:
+                full = pyautogui.screenshot()
+            if self._ocr_contains_keywords(full):
+                w, h = full.size
+                # Return a best-guess coordinate (top-center band)
+                guess = (int(w // 2), int(h * 0.15))
+                log.info("OCR fallback returning approximate location %s", guess)
+                return guess
+        except Exception as e:
+            log.debug("OCR fallback failed: %s", e)
 
         raise AutomationError(
             f"Timed out after {timeout}s waiting for '{label}'. "
-            f"Template searched: {template_path}."
+            f"Template searched: {template_path}. Debug screenshot: {dbg_path}."
         )
 
     def start_scan(self) -> None:
