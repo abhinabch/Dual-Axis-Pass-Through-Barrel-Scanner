@@ -304,26 +304,64 @@ class IDM57Controller:
         return self.move_relative(relative_distance, velocity_rpm=velocity_rpm, accel_ms=accel_ms, decel_ms=decel_ms)
 
 
+from config_manager import load_config, DEFAULT_CONFIG_PATH
+
 # ---------------------------------------------------------------------------
 # Main Scan Sequence Routine
 # ---------------------------------------------------------------------------
-def run_scan_sequence(link, tilt_slave=2, rot_slave=1, tilt_speed=60, rot_speed=60, pause_s=1.0, rot_revs=4.0):
+def run_scan_sequence(
+    link,
+    tilt_slave=None,
+    rot_slave=None,
+    tilt_speed=None,
+    rot_speed=None,
+    pause_s=None,
+    rot_revs=None,
+    tilt_targets=None,
+    config=None,
+    config_path=DEFAULT_CONFIG_PATH,
+    progress_callback=None
+):
     """
     Executes scan routine across specified tilt angles and rotation sweeps:
-    - Tilt positions (ESS17): -8000, -4000, 0, 2000, 5000 pulses
-    - At each tilt step: pause, rotate +rot_revs revolutions (+40,000 pulses for 4 revs on iDM57), rotate -rot_revs revolutions back, return to initial rotation position.
+    - Config loaded from scan_config.json by default or passed via `config` dict.
+    - Tilt positions (ESS17): loaded from sweep_settings (e.g., [-8000, -4000, 0, 2000, 5000] pulses)
+    - At each tilt step: pause, rotate +rot_revs revolutions (+40,000 pulses for 4 revs on iDM57),
+      rotate -rot_revs revolutions back, return to initial rotation position.
     - Return tilt and rotation to initial positions at end.
     """
+    def _notify(msg):
+        logger.info(msg)
+        if progress_callback:
+            try:
+                progress_callback(msg)
+            except Exception:
+                pass
+
+    if config is None:
+        config = load_config(config_path)
+
+    motor_cfg = config.get("motor_settings", {})
+    sweep_cfg = config.get("sweep_settings", {})
+
+    tilt_slave = tilt_slave if tilt_slave is not None else motor_cfg.get("tilt_slave_id", 2)
+    rot_slave = rot_slave if rot_slave is not None else motor_cfg.get("rot_slave_id", 1)
+    tilt_speed = tilt_speed if tilt_speed is not None else sweep_cfg.get("tilt_speed_rpm", 60)
+    rot_speed = rot_speed if rot_speed is not None else sweep_cfg.get("rot_speed_rpm", 60)
+    pause_s = pause_s if pause_s is not None else sweep_cfg.get("pause_seconds", 1.0)
+    rot_revs = rot_revs if rot_revs is not None else sweep_cfg.get("rot_revs", 4.0)
+
+    if tilt_targets is None:
+        tilt_targets = sweep_cfg.get("tilt_targets_pulses", [-8000, -4000, 0, 2000, 5000])
+
     tilt_axis = ESS17Controller(link, slave_id=tilt_slave, initial_position=0)
     rot_axis = IDM57Controller(link, slave_id=rot_slave, initial_position=0)
 
     # Record initial positions
     initial_tilt_pos = tilt_axis.get_position()
     initial_rot_pos = rot_axis.get_position()
-    logger.info(f"Initial positions captured - Tilt (Slave {tilt_slave}): {initial_tilt_pos} pulses, Rot (Slave {rot_slave}): {initial_rot_pos} pulses")
+    _notify(f"Initial positions captured - Tilt (Slave {tilt_slave}): {initial_tilt_pos} pulses, Rot (Slave {rot_slave}): {initial_rot_pos} pulses")
 
-    # Sequence of tilt targets
-    tilt_targets = [-8000, -4000, 0, 2000, 5000]
     rot_pulses = int(rot_revs * IDM57Controller.PULSES_PER_REV)
     rot_deg = rot_revs * 360.0
 
@@ -338,17 +376,18 @@ def run_scan_sequence(link, tilt_slave=2, rot_slave=1, tilt_speed=60, rot_speed=
     print("=" * 65 + "\n")
 
     try:
+        total_steps = len(tilt_targets)
         for idx, target in enumerate(tilt_targets, 1):
-            logger.info(f"\n--- STEP {idx}/{len(tilt_targets)}: Moving Tilt to {target} pulses ({target / ESS17Controller.PULSES_PER_REV:+.2f} revs) ---")
+            _notify(f"Step {idx}/{total_steps}: Moving Tilt to {target} pulses ({target / ESS17Controller.PULSES_PER_REV:+.2f} revs)...")
             if not tilt_axis.move_absolute(target, velocity_rpm=tilt_speed):
                 logger.error(f"Tilt move to {target} failed. Aborting sequence.")
                 break
 
-            logger.info(f"Pausing for {pause_s} seconds at tilt position {target}...")
+            _notify(f"Pausing for {pause_s}s at tilt target {target}...")
             time.sleep(pause_s)
 
             # Rotation motor positive sweep (+rot_revs revolutions)
-            logger.info(f"Executing Rotation sweep: +{rot_deg:.0f} degrees (+{rot_pulses} pulses / {rot_revs:.1f} revs)...")
+            _notify(f"Step {idx}/{total_steps}: Rotation sweep +{rot_deg:.0f}° (+{rot_pulses} pulses)...")
             if not rot_axis.move_relative(rot_pulses, velocity_rpm=rot_speed):
                 logger.error(f"Rotation +{rot_deg:.0f} deg sweep failed. Aborting sequence.")
                 break
@@ -356,7 +395,7 @@ def run_scan_sequence(link, tilt_slave=2, rot_slave=1, tilt_speed=60, rot_speed=
             time.sleep(0.5)
 
             # Rotation motor negative sweep (-rot_revs revolutions back)
-            logger.info(f"Executing Rotation sweep: -{rot_deg:.0f} degrees back (-{rot_pulses} pulses / -{rot_revs:.1f} revs)...")
+            _notify(f"Step {idx}/{total_steps}: Rotation return sweep -{rot_deg:.0f}° (-{rot_pulses} pulses)...")
             if not rot_axis.move_relative(-rot_pulses, velocity_rpm=rot_speed):
                 logger.error(f"Rotation -{rot_deg:.0f} deg return sweep failed. Aborting sequence.")
                 break
@@ -367,54 +406,69 @@ def run_scan_sequence(link, tilt_slave=2, rot_slave=1, tilt_speed=60, rot_speed=
     except Exception as e:
         logger.exception(f"Unexpected error during scan sequence execution: {e}")
     finally:
-        logger.info("\n--- RETURNING AXES TO INITIAL POSITIONS ---")
+        _notify("Returning axes to initial home positions...")
         logger.info(f"Returning Tilt axis to initial position ({initial_tilt_pos} pulses)...")
         tilt_axis.move_absolute(initial_tilt_pos, velocity_rpm=tilt_speed)
         
         logger.info(f"Returning Rotation axis to initial position ({initial_rot_pos} pulses)...")
         rot_axis.move_absolute(initial_rot_pos, velocity_rpm=rot_speed)
 
-        logger.info("Scan sequence finished.")
+        _notify("Scan sequence completed.")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Dual-Axis Scan Sequence (ESS17 Tilt + iDM57 Rotation)")
-    parser.add_argument("--port", default="COM3", help="Serial port for RS485 adapter (default: COM3)")
-    parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default: 115200)")
-    parser.add_argument("--tilt-slave", type=int, default=2, help="Modbus Slave ID for Tilt motor (default: 2)")
-    parser.add_argument("--rot-slave", type=int, default=1, help="Modbus Slave ID for Rotation motor (default: 1)")
-    parser.add_argument("--tilt-speed", type=int, default=60, help="Tilt speed in RPM (default: 60 RPM)")
-    parser.add_argument("--rot-speed", type=int, default=60, help="Rotation speed in RPM (default: 60 RPM)")
-    parser.add_argument("--pause", type=float, default=1.0, help="Pause duration at tilt position in seconds (default: 1.0s)")
-    parser.add_argument("--rot-revs", type=float, default=4.0, help="Number of rotation revolutions per sweep pass (default: 4.0 revs / 1440 deg)")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help=f"Path to scan config file (default: {DEFAULT_CONFIG_PATH})")
+    parser.add_argument("--port", help="Serial port for RS485 adapter")
+    parser.add_argument("--baud", type=int, help="Baud rate")
+    parser.add_argument("--tilt-slave", type=int, help="Modbus Slave ID for Tilt motor")
+    parser.add_argument("--rot-slave", type=int, help="Modbus Slave ID for Rotation motor")
+    parser.add_argument("--tilt-speed", type=int, help="Tilt speed in RPM")
+    parser.add_argument("--rot-speed", type=int, help="Rotation speed in RPM")
+    parser.add_argument("--pause", type=float, help="Pause duration at tilt position in seconds")
+    parser.add_argument("--rot-revs", type=float, help="Number of rotation revolutions per sweep pass")
     args = parser.parse_args()
 
-    link = ModbusLink(port=args.port, baudrate=args.baud)
+    cfg = load_config(args.config)
+    motor_cfg = cfg.get("motor_settings", {})
+    sweep_cfg = cfg.get("sweep_settings", {})
+
+    port = args.port or motor_cfg.get("port", "COM3")
+    baud = args.baud or motor_cfg.get("baudrate", 115200)
+    tilt_slave = args.tilt_slave or motor_cfg.get("tilt_slave_id", 2)
+    rot_slave = args.rot_slave or motor_cfg.get("rot_slave_id", 1)
+    tilt_speed = args.tilt_speed or sweep_cfg.get("tilt_speed_rpm", 60)
+    rot_speed = args.rot_speed or sweep_cfg.get("rot_speed_rpm", 60)
+    pause_s = args.pause if args.pause is not None else sweep_cfg.get("pause_seconds", 1.0)
+    rot_revs = args.rot_revs if args.rot_revs is not None else sweep_cfg.get("rot_revs", 4.0)
+
+    link = ModbusLink(port=port, baudrate=baud)
 
     if not link.connect():
-        logger.error(f"Failed to connect to Modbus adapter on {args.port}.")
+        logger.error(f"Failed to connect to Modbus adapter on {port}.")
         return
 
-    tilt_axis = ESS17Controller(link, slave_id=args.tilt_slave)
-    rot_axis = IDM57Controller(link, slave_id=args.rot_slave)
+    tilt_axis = ESS17Controller(link, slave_id=tilt_slave)
+    rot_axis = IDM57Controller(link, slave_id=rot_slave)
 
     try:
         if not tilt_axis.enable():
-            logger.error(f"Failed to enable Tilt drive (Slave {args.tilt_slave}).")
+            logger.error(f"Failed to enable Tilt drive (Slave {tilt_slave}).")
             return
             
         if not rot_axis.enable():
-            logger.error(f"Failed checking Rotation drive status (Slave {args.rot_slave}).")
+            logger.error(f"Failed checking Rotation drive status (Slave {rot_slave}).")
             return
 
         run_scan_sequence(
             link=link,
-            tilt_slave=args.tilt_slave,
-            rot_slave=args.rot_slave,
-            tilt_speed=args.tilt_speed,
-            rot_speed=args.rot_speed,
-            pause_s=args.pause,
-            rot_revs=args.rot_revs
+            tilt_slave=tilt_slave,
+            rot_slave=rot_slave,
+            tilt_speed=tilt_speed,
+            rot_speed=rot_speed,
+            pause_s=pause_s,
+            rot_revs=rot_revs,
+            config=cfg
         )
     except KeyboardInterrupt:
         print("\n[Ctrl+C] Motion aborted by user. Issuing emergency stop to both drives...")
@@ -426,3 +480,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

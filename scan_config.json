@@ -1,0 +1,22 @@
+{
+  "motor_settings": {
+    "port": "COM3",
+    "baudrate": 115200,
+    "tilt_slave_id": 2,
+    "rot_slave_id": 1,
+    "tilt_pulses_per_rev": 1000,
+    "rot_pulses_per_rev": 10000,
+    "tilt_accel_ms": 200,
+    "tilt_decel_ms": 200,
+    "rot_accel_ms": 300,
+    "rot_decel_ms": 300
+  },
+  "sweep_settings": {
+    "tilt_speed_rpm": 60,
+    "rot_speed_rpm": 60,
+    "tilt_targets_pulses": [-8000, -4000, 0, 2000, 5000],
+    "rot_deg": 1440.0,
+    "rot_revs": 4.0,
+    "pause_seconds": 1.0
+  }
+}

@@ -4,8 +4,355 @@ import threading
 import queue
 import time
 import logging
+import math
 from enum import Enum, auto
-from typing import Optional, Callable
+from typing import Optional, Callable, List
+
+def deg_to_encoder(deg: float) -> int:
+    """Linearly map degrees [-158°, +90°] to encoder pulses [-8200, +7700]."""
+    deg = max(-158.0, min(90.0, float(deg)))
+    if deg >= 0:
+        enc = deg * (7700.0 / 90.0)
+    else:
+        enc = deg * (8200.0 / 158.0)
+    return int(round(enc))
+
+def encoder_to_deg(enc: int) -> float:
+    """Linearly map encoder pulses [-8200, +7700] to degrees [-158°, +90°]."""
+    enc_val = float(enc)
+    if enc_val >= 0:
+        deg = enc_val * (90.0 / 7700.0)
+    else:
+        deg = enc_val * (158.0 / 8200.0)
+    return round(max(-158.0, min(90.0, deg)), 1)
+
+
+class TiltProtractorWidget(ctk.CTkFrame):
+    """
+    Interactive circular dial protractor selector for setting tilt target angles per pass.
+    Maps degrees [-158°, +90°] to encoder values [-8200, +7700].
+    """
+    def __init__(self, parent, on_change_callback: Optional[Callable] = None, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.on_change_callback = on_change_callback
+
+        # Initial pass degrees default (5 passes, 0° included)
+        # Default encoder values [-8000, -4000, 0, 2000, 5000] -> [-154.1, -77.1, 0.0, 23.4, 58.4]
+        self.passes: List[float] = [-154.1, -77.1, 0.0, 23.4, 58.4]
+        self.active_pass_idx: int = 0
+        self._updating_from_entry = False
+
+        self._build_ui()
+        self.draw_dial()
+
+    def _build_ui(self):
+        # Top Controls: Pass count
+        top_ctrl = ctk.CTkFrame(self, fg_color="transparent")
+        top_ctrl.pack(fill="x", padx=10, pady=(5, 10))
+
+        ctk.CTkLabel(top_ctrl, text="Number of Passes:", font=("Roboto", 13, "bold")).pack(side="left", padx=(0, 10))
+        
+        self.pass_count_var = tk.StringVar(value=str(len(self.passes)))
+        self.pass_count_entry = ctk.CTkEntry(top_ctrl, textvariable=self.pass_count_var, width=60)
+        self.pass_count_entry.pack(side="left", padx=5)
+        
+        ctk.CTkButton(top_ctrl, text="Set Passes", width=80, command=self._on_pass_count_change).pack(side="left", padx=5)
+
+        ctk.CTkLabel(top_ctrl, text="(Default = 5, 0° pre-set)", font=("Roboto", 11), text_color="gray").pack(side="left", padx=10)
+
+        # Main Layout: Left Dial Canvas, Right Pass List
+        main_box = ctk.CTkFrame(self, fg_color="transparent")
+        main_box.pack(fill="both", expand=True, padx=5, pady=5)
+        main_box.grid_columnconfigure(0, weight=0)
+        main_box.grid_columnconfigure(1, weight=1)
+
+        # Dial Canvas Container
+        canvas_frame = ctk.CTkFrame(main_box, fg_color="#181818", corner_radius=10)
+        canvas_frame.grid(row=0, column=0, padx=(0, 15), pady=5, sticky="n")
+
+        self.canvas_size = 320
+        self.cx = self.canvas_size // 2
+        self.cy = self.canvas_size // 2
+        self.r = 115
+
+        self.canvas = tk.Canvas(
+            canvas_frame,
+            width=self.canvas_size,
+            height=self.canvas_size,
+            bg="#141414",
+            highlightthickness=0
+        )
+        self.canvas.pack(padx=10, pady=10)
+
+        self.canvas.bind("<Button-1>", self._on_canvas_click)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+
+        # Right Panel: Pass Entries List
+        self.pass_list_frame = ctk.CTkScrollableFrame(main_box, height=320, label_text="Pass Angles & Computed Encoder Targets")
+        self.pass_list_frame.grid(row=0, column=1, sticky="nsew", pady=5)
+
+        self._rebuild_pass_entries()
+
+    def _rebuild_pass_entries(self):
+        """Recreate entry rows for each pass."""
+        for child in self.pass_list_frame.winfo_children():
+            child.destroy()
+
+        self.entry_vars = []
+        self.encoder_labels = []
+
+        for i, p_deg in enumerate(self.passes):
+            row_frame = ctk.CTkFrame(
+                self.pass_list_frame, 
+                fg_color="#2b2b2b" if i == self.active_pass_idx else "transparent",
+                border_width=1 if i == self.active_pass_idx else 0,
+                border_color="#3a7ebf"
+            )
+            row_frame.pack(fill="x", padx=5, pady=3)
+
+            # Pass selector button
+            btn_color = "#1f538d" if i == self.active_pass_idx else "gray"
+            btn = ctk.CTkButton(
+                row_frame, 
+                text=f"Pass {i+1}", 
+                width=65, 
+                fg_color=btn_color,
+                command=lambda idx=i: self.select_pass(idx)
+            )
+            btn.pack(side="left", padx=5, pady=5)
+
+            # Degree numeric input
+            var = tk.StringVar(value=f"{p_deg:.1f}")
+            self.entry_vars.append(var)
+
+            deg_entry = ctk.CTkEntry(row_frame, textvariable=var, width=80)
+            deg_entry.pack(side="left", padx=5, pady=5)
+            deg_entry.bind("<FocusOut>", lambda e, idx=i: self._on_entry_changed(idx))
+            deg_entry.bind("<Return>", lambda e, idx=i: self._on_entry_changed(idx))
+
+            ctk.CTkLabel(row_frame, text="°", font=("Roboto", 14, "bold")).pack(side="left")
+
+            # Computed raw encoder value label
+            enc_val = deg_to_encoder(p_deg)
+            lbl = ctk.CTkLabel(row_frame, text=f"Raw Encoder: {enc_val:+d} pulses", text_color="#aaaaaa", font=("Consolas", 12))
+            lbl.pack(side="left", padx=15, pady=5)
+            self.encoder_labels.append(lbl)
+
+    def select_pass(self, idx: int):
+        if 0 <= idx < len(self.passes):
+            self.active_pass_idx = idx
+            self._rebuild_pass_entries()
+            self.draw_dial()
+
+    def _on_pass_count_change(self):
+        try:
+            count = int(self.pass_count_var.get().strip())
+            count = max(1, min(20, count))
+        except ValueError:
+            count = len(self.passes)
+
+        self.set_pass_count(count)
+
+    def set_pass_count(self, count: int):
+        if count == len(self.passes):
+            return
+
+        if count < len(self.passes):
+            self.passes = self.passes[:count]
+        else:
+            # Generate new pass angles evenly between min/max or at 0
+            needed = count - len(self.passes)
+            start_deg = self.passes[-1] if self.passes else 0.0
+            for i in range(needed):
+                new_deg = min(90.0, start_deg + (i + 1) * 15.0)
+                self.passes.append(round(new_deg, 1))
+
+        if self.active_pass_idx >= len(self.passes):
+            self.active_pass_idx = len(self.passes) - 1
+
+        self.pass_count_var.set(str(len(self.passes)))
+        self._rebuild_pass_entries()
+        self.draw_dial()
+        self._notify_change()
+
+    def _on_entry_changed(self, idx: int):
+        if self._updating_from_entry:
+            return
+        self._updating_from_entry = True
+        try:
+            val_str = self.entry_vars[idx].get().strip()
+            val = float(val_str)
+            clamped = max(-158.0, min(90.0, val))
+            self.passes[idx] = round(clamped, 1)
+            self.entry_vars[idx].set(f"{self.passes[idx]:.1f}")
+        except ValueError:
+            self.entry_vars[idx].set(f"{self.passes[idx]:.1f}")
+        finally:
+            self._updating_from_entry = False
+
+        # Update encoder label
+        enc_val = deg_to_encoder(self.passes[idx])
+        self.encoder_labels[idx].configure(text=f"Raw Encoder: {enc_val:+d} pulses")
+        self.draw_dial()
+        self._notify_change()
+
+    def draw_dial(self):
+        self.canvas.delete("all")
+        cx, cy, r = self.cx, self.cy, self.r
+
+        # Draw Dead Zone Arc (top ~112° between +90° and -158°)
+        # In canvas polar angle (0° = 3 o'clock, counter-clockwise):
+        # 0° = +90° pass angle (3 o'clock). Dead zone spans 0° to 112° polar.
+        self.canvas.create_arc(
+            cx - r, cy - r, cx + r, cy + r,
+            start=0, extent=112,
+            fill="#262626", outline="#444444", width=1.5, style="pieslice"
+        )
+        # Dead Zone text
+        self.canvas.create_text(
+            cx, cy - r + 35,
+            text="DEAD ZONE\n(UNREACHABLE)",
+            fill="#666666", font=("Roboto", 9, "bold"), justify="center"
+        )
+
+        # Draw Valid Arc (-158° to +90°, span 248° counter-clockwise from 112°)
+        self.canvas.create_arc(
+            cx - r, cy - r, cx + r, cy + r,
+            start=112, extent=248,
+            fill="#181e26", outline="#3a7ebf", width=2, style="pieslice"
+        )
+
+        # Gridlines & Degree Labels
+        grid_degs = [-158, -150, -120, -90, -60, -30, 0, 30, 60, 90]
+        for g_deg in grid_degs:
+            polar_rad = math.radians(270.0 + g_deg)
+            cos_a = math.cos(polar_rad)
+            sin_a = math.sin(polar_rad)
+
+            # Grid tick
+            x_outer = cx + r * cos_a
+            y_outer = cy - r * sin_a
+            x_inner = cx + (r - 10) * cos_a
+            y_inner = cy - (r - 10) * sin_a
+            
+            line_color = "#555555" if g_deg not in [-158, 0, 90] else "#3a7ebf"
+            self.canvas.create_line(x_inner, y_inner, x_outer, y_outer, fill=line_color, width=1.5)
+
+            # Degree labels for main positions
+            if g_deg in [-158, -90, 0, 90]:
+                x_lbl = cx + (r - 26) * cos_a
+                y_lbl = cy - (r - 26) * sin_a
+                lbl_str = f"{g_deg}°"
+                self.canvas.create_text(x_lbl, y_lbl, text=lbl_str, fill="#ffffff", font=("Roboto", 9, "bold"))
+
+        # Center indicator / Scanner reference
+        self.canvas.create_oval(cx - 6, cy - 6, cx + 6, cy + 6, fill="#3a7ebf", outline="")
+        self.canvas.create_line(cx, cy, cx, cy + r - 15, fill="#3a7ebf", dash=(2, 2), width=1)
+
+        # Draw Pass Markers
+        for idx, p_deg in enumerate(self.passes):
+            polar_rad = math.radians(270.0 + p_deg)
+            cos_a = math.cos(polar_rad)
+            sin_a = math.sin(polar_rad)
+
+            mx = cx + (r - 5) * cos_a
+            my = cy - (r - 5) * sin_a
+
+            is_active = (idx == self.active_pass_idx)
+            mr = 12 if is_active else 8
+
+            # Radial line to active marker
+            if is_active:
+                self.canvas.create_line(cx, cy, mx, my, fill="#00d2ff", width=2)
+
+            fill_color = "#00d2ff" if is_active else "#444444"
+            outline_color = "#ffffff" if is_active else "#888888"
+            text_color = "#000000" if is_active else "#ffffff"
+
+            self.canvas.create_oval(
+                mx - mr, my - mr, mx + mr, my + mr,
+                fill=fill_color, outline=outline_color, width=2 if is_active else 1
+            )
+            self.canvas.create_text(
+                mx, my,
+                text=str(idx + 1),
+                fill=text_color,
+                font=("Roboto", 10 if is_active else 8, "bold")
+            )
+
+    def _event_to_deg(self, event) -> Optional[float]:
+        dx = event.x - self.cx
+        dy = self.cy - event.y  # Inverted y
+        if math.hypot(dx, dy) < 10:  # Ignore near center
+            return None
+
+        polar_rad = math.atan2(dy, dx)
+        polar_deg = math.degrees(polar_rad) % 360.0
+
+        deg = (polar_deg - 270.0) % 360.0
+        if deg > 180.0:
+            deg -= 360.0
+
+        # Clamp to valid [-158°, +90°]
+        if deg > 90.0:
+            if deg <= 136.0:
+                deg = 90.0
+            else:
+                deg = -158.0
+        elif deg < -158.0:
+            deg = -158.0
+
+        return deg
+
+    def _on_canvas_click(self, event):
+        # First check if user clicked an existing marker to select it
+        for idx, p_deg in enumerate(self.passes):
+            polar_rad = math.radians(270.0 + p_deg)
+            mx = self.cx + (self.r - 5) * math.cos(polar_rad)
+            my = self.cy - (self.r - 5) * math.sin(polar_rad)
+            if math.hypot(event.x - mx, event.y - my) <= 16:
+                self.select_pass(idx)
+                return
+
+        # Otherwise move active marker to clicked angle
+        deg = self._event_to_deg(event)
+        if deg is not None:
+            self.passes[self.active_pass_idx] = round(deg, 1)
+            self._sync_active_entry()
+            self.draw_dial()
+            self._notify_change()
+
+    def _on_canvas_drag(self, event):
+        deg = self._event_to_deg(event)
+        if deg is not None:
+            self.passes[self.active_pass_idx] = round(deg, 1)
+            self._sync_active_entry()
+            self.draw_dial()
+            self._notify_change()
+
+    def _sync_active_entry(self):
+        idx = self.active_pass_idx
+        if idx < len(self.entry_vars):
+            p_deg = self.passes[idx]
+            self.entry_vars[idx].set(f"{p_deg:.1f}")
+            enc_val = deg_to_encoder(p_deg)
+            self.encoder_labels[idx].configure(text=f"Raw Encoder: {enc_val:+d} pulses")
+
+    def _notify_change(self):
+        if self.on_change_callback:
+            self.on_change_callback(self.get_pulses())
+
+    def get_pulses(self) -> List[int]:
+        return [deg_to_encoder(d) for d in self.passes]
+
+    def set_pulses(self, pulses: List[int]):
+        if not pulses:
+            return
+        self.passes = [encoder_to_deg(p) for p in pulses]
+        self.active_pass_idx = min(self.active_pass_idx, len(self.passes) - 1)
+        self.pass_count_var.set(str(len(self.passes)))
+        self._rebuild_pass_entries()
+        self.draw_dial()
 
 # Backend imports
 from pymodbus.client import ModbusSerialClient
@@ -27,6 +374,13 @@ from scan_sequence import run_scan_sequence, ModbusLink
 from reconstruction.barrel_reconstruct import run_reconstruction_pipeline # Assumed entry point
 from reconstruction.barrel_batch import save_to_log # Assumed entry point
 from hardware.creality_autostart import CrealityAutomator, AutomationError
+from config_manager import (
+    load_config,
+    save_config,
+    reset_to_defaults,
+    parse_tilt_targets_str,
+    tilt_targets_to_str
+)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -63,6 +417,9 @@ class AppGUI(ctk.CTk):
         self.automator = CrealityAutomator()
         self.worker_queue = queue.Queue()
         self.stop_event = threading.Event()
+
+        # Config state
+        self.scan_config = load_config()
 
         # Operator Data
         self.barrel_id = tk.StringVar()
@@ -491,8 +848,8 @@ class AppGUI(ctk.CTk):
                 log.warning("Creality Scan autostart note: %s", scan_err)
 
             # Execute the raster sweep using scan_sequence.py
-            # We use the link already established in the GUI
-            run_scan_sequence(self.client, progress_callback=progress_cb)
+            # We use the link already established in the GUI and configured scan settings
+            run_scan_sequence(self.client, config=self.scan_config, progress_callback=progress_cb)
             
             # Stop scan in scanner UI
             try:
@@ -702,58 +1059,238 @@ class AppGUI(ctk.CTk):
     def create_technician_frame(self):
         frame = ctk.CTkFrame(self.main_container)
         frame.grid_columnconfigure(0, weight=1)
-        
-        title_lbl = ctk.CTkLabel(frame, text="Technician / Advanced Panel", font=("Roboto", 32, "bold"))
-        title_lbl.pack(pady=(40, 20))
-        
-        # Connection Settings
-        settings_frame = ctk.CTkFrame(frame)
-        settings_frame.pack(pady=20, padx=50, fill="x")
-        
-        ctk.CTkLabel(settings_frame, text="Modbus Connection Settings", font=("Roboto", 18, "bold")).pack(pady=10)
-        
-        conn_row = ctk.CTkFrame(settings_frame, fg_color="transparent")
-        conn_row.pack(pady=10)
-        
-        self.port_entry = ctk.CTkEntry(conn_row, placeholder_text="COM Port (e.g. COM3)", width=150)
-        self.port_entry.pack(side="left", padx=10)
-        
-        self.baud_entry = ctk.CTkEntry(conn_row, placeholder_text="Baudrate (e.g. 9600)", width=150)
-        self.baud_entry.pack(side="left", padx=10)
-        
-        ctk.CTkButton(conn_row, text="Apply Settings", command=self.apply_settings).pack(side="left", padx=10)
-        
-        # Manual Controls
-        controls_frame = ctk.CTkFrame(frame)
-        controls_frame.pack(pady=20, padx=50, fill="x")
-        
+        frame.grid_rowconfigure(1, weight=1)
+
+        # Back Button / Title Header
+        header_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        header_frame.pack(fill="x", padx=20, pady=(15, 5))
+
+        back_btn = ctk.CTkButton(header_frame, text="← Back", width=60, fg_color="transparent", border_width=1,
+                                 command=lambda: self.show_frame(AppState.READY))
+        back_btn.pack(side="left", padx=10)
+
+        title_lbl = ctk.CTkLabel(header_frame, text="Technician & Configuration Panel", font=("Roboto", 28, "bold"))
+        title_lbl.pack(side="left", padx=20)
+
+        # Scrollable Content Area
+        scroll_container = ctk.CTkScrollableFrame(frame)
+        scroll_container.pack(fill="both", expand=True, padx=20, pady=10)
+        scroll_container.grid_columnconfigure(0, weight=1)
+
+        # -------------------------------------------------------------------
+        # Section 1: Motor Hardware & Software Sweep Configuration
+        # -------------------------------------------------------------------
+        config_box = ctk.CTkFrame(scroll_container)
+        config_box.pack(fill="x", padx=20, pady=10)
+
+        ctk.CTkLabel(config_box, text="Motor & Software Sweep Configuration", font=("Roboto", 18, "bold")).pack(pady=(15, 5))
+        ctk.CTkLabel(config_box, text="Configure motor speeds, Modbus settings, and pass-through sweep angles", font=("Roboto", 12), text_color="gray").pack(pady=(0, 15))
+
+        grid_frame = ctk.CTkFrame(config_box, fg_color="transparent")
+        grid_frame.pack(fill="x", padx=20, pady=10)
+        grid_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        # Row 0: Comms Parameters
+        ctk.CTkLabel(grid_frame, text="Serial Port:").grid(row=0, column=0, padx=10, pady=5, sticky="e")
+        self.port_entry = ctk.CTkEntry(grid_frame, width=140)
+        self.port_entry.grid(row=0, column=1, padx=10, pady=5, sticky="w")
+
+        ctk.CTkLabel(grid_frame, text="Baud Rate:").grid(row=0, column=2, padx=10, pady=5, sticky="e")
+        self.baud_entry = ctk.CTkEntry(grid_frame, width=140)
+        self.baud_entry.grid(row=0, column=3, padx=10, pady=5, sticky="w")
+
+        # Row 1: Slave IDs
+        ctk.CTkLabel(grid_frame, text="Tilt Slave ID (ESS17):").grid(row=1, column=0, padx=10, pady=5, sticky="e")
+        self.tilt_slave_entry = ctk.CTkEntry(grid_frame, width=140)
+        self.tilt_slave_entry.grid(row=1, column=1, padx=10, pady=5, sticky="w")
+
+        ctk.CTkLabel(grid_frame, text="Rot Slave ID (iDM57):").grid(row=1, column=2, padx=10, pady=5, sticky="e")
+        self.rot_slave_entry = ctk.CTkEntry(grid_frame, width=140)
+        self.rot_slave_entry.grid(row=1, column=3, padx=10, pady=5, sticky="w")
+
+        # Row 2: Motor Speeds
+        ctk.CTkLabel(grid_frame, text="Tilt Speed (RPM):").grid(row=2, column=0, padx=10, pady=5, sticky="e")
+        self.tilt_speed_entry = ctk.CTkEntry(grid_frame, width=140)
+        self.tilt_speed_entry.grid(row=2, column=1, padx=10, pady=5, sticky="w")
+
+        ctk.CTkLabel(grid_frame, text="Rotation Speed (RPM):").grid(row=2, column=2, padx=10, pady=5, sticky="e")
+        self.rot_speed_entry = ctk.CTkEntry(grid_frame, width=140)
+        self.rot_speed_entry.grid(row=2, column=3, padx=10, pady=5, sticky="w")
+
+        # Row 3: Sweep Extent & Pause (Swapped: Pause Duration is now first, Rotation per Pass second)
+        ctk.CTkLabel(grid_frame, text="Pause Duration (s):").grid(row=3, column=0, padx=10, pady=5, sticky="e")
+        self.pause_entry = ctk.CTkEntry(grid_frame, width=140)
+        self.pause_entry.grid(row=3, column=1, padx=10, pady=5, sticky="w")
+
+        ctk.CTkLabel(grid_frame, text="Rotation per Pass (Revs):").grid(row=3, column=2, padx=10, pady=5, sticky="e")
+        self.rot_revs_entry = ctk.CTkEntry(grid_frame, width=140)
+        self.rot_revs_entry.grid(row=3, column=3, padx=10, pady=5, sticky="w")
+
+        # Row 4: Tilt Target Selector (Interactive Circular Protractor Dial + Secondary Raw Input)
+        targets_container = ctk.CTkFrame(config_box, fg_color="transparent")
+        targets_container.pack(fill="x", padx=20, pady=10)
+
+        ctk.CTkLabel(targets_container, text="Tilt Pass Target Angles (Interactive Protractor Dial):", font=("Roboto", 14, "bold")).pack(anchor="w", padx=10, pady=(5, 5))
+
+        self.tilt_protractor = TiltProtractorWidget(
+            targets_container,
+            on_change_callback=self._on_protractor_change
+        )
+        self.tilt_protractor.pack(fill="x", padx=10, pady=5)
+
+        # Secondary Raw Encoder Target Field (Read-only / secondary reference for technicians)
+        raw_frame = ctk.CTkFrame(targets_container, fg_color="transparent")
+        raw_frame.pack(fill="x", padx=10, pady=(5, 10))
+
+        ctk.CTkLabel(raw_frame, text="Secondary Raw Encoder Target Pulses (comma-separated):", font=("Roboto", 11), text_color="gray").pack(anchor="w", pady=(2, 2))
+        self.tilt_targets_entry = ctk.CTkEntry(raw_frame, width=650, placeholder_text="-8000, -4000, 0, 2000, 5000")
+        self.tilt_targets_entry.pack(anchor="w", fill="x")
+
+        # Config Buttons & Status
+        cfg_btn_row = ctk.CTkFrame(config_box, fg_color="transparent")
+        cfg_btn_row.pack(pady=10)
+
+        ctk.CTkButton(cfg_btn_row, text="💾 Save Configuration", fg_color="#1f538d", hover_color="#3a7ebf", command=self.save_gui_config).pack(side="left", padx=10)
+        ctk.CTkButton(cfg_btn_row, text="↺ Reset Defaults", fg_color="gray", command=self.reset_gui_config).pack(side="left", padx=10)
+        ctk.CTkButton(cfg_btn_row, text="🔌 Apply Comms Settings", fg_color="#2b5b84", command=self.apply_settings).pack(side="left", padx=10)
+
+        self.cfg_status_lbl = ctk.CTkLabel(config_box, text="", font=("Roboto", 13, "bold"))
+        self.cfg_status_lbl.pack(pady=(0, 10))
+
+        # Populate current fields from self.scan_config
+        self.populate_gui_config_fields()
+
+        # -------------------------------------------------------------------
+        # Section 2: Manual Axis Control (Jogging)
+        # -------------------------------------------------------------------
+        controls_frame = ctk.CTkFrame(scroll_container)
+        controls_frame.pack(fill="x", padx=20, pady=10)
+
         ctk.CTkLabel(controls_frame, text="Manual Axis Control (Jogging)", font=("Roboto", 18, "bold")).pack(pady=10)
-        
+
         jog_row = ctk.CTkFrame(controls_frame, fg_color="transparent")
         jog_row.pack(pady=10)
-        
-        # This is just a placeholder; in a real app we'd have buttons for +1/-1 rev
+
         ctk.CTkButton(jog_row, text="PAN +1 Rev", command=lambda: self.jog_axis(UNIT_ID_PAN, 1)).pack(side="left", padx=10)
         ctk.CTkButton(jog_row, text="PAN -1 Rev", command=lambda: self.jog_axis(UNIT_ID_PAN, -1)).pack(side="left", padx=10)
         ctk.CTkButton(jog_row, text="TILT +1 Rev", command=lambda: self.jog_axis(UNIT_ID_TILT, 1)).pack(side="left", padx=10)
         ctk.CTkButton(jog_row, text="TILT -1 Rev", command=lambda: self.jog_axis(UNIT_ID_TILT, -1)).pack(side="left", padx=10)
-        
-        # Manual Reconstruction
-        recon_frame = ctk.CTkFrame(frame)
-        recon_frame.pack(pady=20, padx=50, fill="x")
-        
+
+        # -------------------------------------------------------------------
+        # Section 3: Manual Reconstruction
+        # -------------------------------------------------------------------
+        recon_frame = ctk.CTkFrame(scroll_container)
+        recon_frame.pack(fill="x", padx=20, pady=10)
+
         ctk.CTkLabel(recon_frame, text="Manual File Reconstruction", font=("Roboto", 18, "bold")).pack(pady=10)
-        
+
         recon_row = ctk.CTkFrame(recon_frame, fg_color="transparent")
         recon_row.pack(pady=10)
-        
+
         self.file_path_entry = ctk.CTkEntry(recon_row, placeholder_text="Path to .obscan file...", width=400)
         self.file_path_entry.pack(side="left", padx=10)
-        
+
         ctk.CTkButton(recon_row, text="Run Reconstruction", command=self.manual_reconstruct).pack(side="left", padx=10)
-        
+
         return frame
+
+    def _on_protractor_change(self, pulses: List[int]):
+        """Sync protractor changes with the secondary raw encoder text entry."""
+        if hasattr(self, "tilt_targets_entry"):
+            self.tilt_targets_entry.delete(0, "end")
+            self.tilt_targets_entry.insert(0, tilt_targets_to_str(pulses))
+
+    def populate_gui_config_fields(self):
+        """Populate GUI entries from current self.scan_config."""
+        m_cfg = self.scan_config.get("motor_settings", {})
+        s_cfg = self.scan_config.get("sweep_settings", {})
+
+        if hasattr(self, "port_entry"):
+            self.port_entry.delete(0, "end")
+            self.port_entry.insert(0, str(m_cfg.get("port", "COM3")))
+
+        if hasattr(self, "baud_entry"):
+            self.baud_entry.delete(0, "end")
+            self.baud_entry.insert(0, str(m_cfg.get("baudrate", 115200)))
+
+        if hasattr(self, "tilt_slave_entry"):
+            self.tilt_slave_entry.delete(0, "end")
+            self.tilt_slave_entry.insert(0, str(m_cfg.get("tilt_slave_id", 2)))
+
+        if hasattr(self, "rot_slave_entry"):
+            self.rot_slave_entry.delete(0, "end")
+            self.rot_slave_entry.insert(0, str(m_cfg.get("rot_slave_id", 1)))
+
+        if hasattr(self, "tilt_speed_entry"):
+            self.tilt_speed_entry.delete(0, "end")
+            self.tilt_speed_entry.insert(0, str(s_cfg.get("tilt_speed_rpm", 60)))
+
+        if hasattr(self, "rot_speed_entry"):
+            self.rot_speed_entry.delete(0, "end")
+            self.rot_speed_entry.insert(0, str(s_cfg.get("rot_speed_rpm", 60)))
+
+        if hasattr(self, "rot_revs_entry"):
+            self.rot_revs_entry.delete(0, "end")
+            self.rot_revs_entry.insert(0, str(s_cfg.get("rot_revs", 4.0)))
+
+        if hasattr(self, "pause_entry"):
+            self.pause_entry.delete(0, "end")
+            self.pause_entry.insert(0, str(s_cfg.get("pause_seconds", 1.0)))
+
+        targets = s_cfg.get("tilt_targets_pulses", [-8000, -4000, 0, 2000, 5000])
+
+        if hasattr(self, "tilt_targets_entry"):
+            self.tilt_targets_entry.delete(0, "end")
+            self.tilt_targets_entry.insert(0, tilt_targets_to_str(targets))
+
+        if hasattr(self, "tilt_protractor"):
+            self.tilt_protractor.set_pulses(targets)
+
+    def save_gui_config(self):
+        """Save input values from GUI into self.scan_config and write to scan_config.json."""
+        try:
+            m_cfg = self.scan_config.get("motor_settings", {})
+            s_cfg = self.scan_config.get("sweep_settings", {})
+
+            m_cfg["port"] = self.port_entry.get().strip()
+            m_cfg["baudrate"] = int(self.baud_entry.get().strip())
+            m_cfg["tilt_slave_id"] = int(self.tilt_slave_entry.get().strip())
+            m_cfg["rot_slave_id"] = int(self.rot_slave_entry.get().strip())
+
+            s_cfg["tilt_speed_rpm"] = int(self.tilt_speed_entry.get().strip())
+            s_cfg["rot_speed_rpm"] = int(self.rot_speed_entry.get().strip())
+            s_cfg["rot_revs"] = float(self.rot_revs_entry.get().strip())
+            s_cfg["rot_deg"] = s_cfg["rot_revs"] * 360.0
+            s_cfg["pause_seconds"] = float(self.pause_entry.get().strip())
+
+            if hasattr(self, "tilt_protractor"):
+                parsed_targets = self.tilt_protractor.get_pulses()
+            else:
+                parsed_targets = parse_tilt_targets_str(self.tilt_targets_entry.get())
+
+            if parsed_targets:
+                s_cfg["tilt_targets_pulses"] = parsed_targets
+
+            self.scan_config["motor_settings"] = m_cfg
+            self.scan_config["sweep_settings"] = s_cfg
+
+            if save_config(self.scan_config):
+                self.cfg_status_lbl.configure(text="✔ Configuration saved to scan_config.json", text_color="green")
+                self.after(3000, lambda: self.cfg_status_lbl.configure(text=""))
+            else:
+                self.cfg_status_lbl.configure(text="✖ Failed to save scan_config.json", text_color="red")
+        except Exception as e:
+            log.error(f"Error saving config from GUI: {e}")
+            self.cfg_status_lbl.configure(text=f"✖ Error: {e}", text_color="red")
+
+    def reset_gui_config(self):
+        """Reset config to factory defaults."""
+        self.scan_config = reset_to_defaults()
+        self.populate_gui_config_fields()
+        self.cfg_status_lbl.configure(text="✔ Reset to default configuration", text_color="yellow")
+        self.after(3000, lambda: self.cfg_status_lbl.configure(text=""))
 
 if __name__ == "__main__":
     app = AppGUI()
     app.mainloop()
+
