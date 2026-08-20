@@ -865,12 +865,16 @@ class AppGUI(ctk.CTk):
             if self.link is None:
                 raise PipelineError("Motor link is not connected. Cannot run scan sequence.")
 
-            # Trigger Creality Scan autostart sequence
+            # Trigger Creality Scan autostart sequence. If this fails, the motors must
+            # NOT proceed to sweep with no active capture running -- surface it instead
+            # of silently continuing as if the scan had started.
             log.info("Triggering Creality Scan autostart sequence...")
             try:
                 self.automator.start_scan()
             except Exception as scan_err:
-                log.warning("Creality Scan autostart note: %s", scan_err)
+                raise PipelineError(
+                    f"Failed to start Creality Scan capture: {scan_err}"
+                ) from scan_err
 
             # Execute the raster sweep using scan_sequence.py. Note: this needs the
             # ModbusLink wrapper (self.link), NOT the raw pymodbus client (self.client) --
