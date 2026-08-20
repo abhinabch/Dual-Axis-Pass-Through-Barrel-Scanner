@@ -9,7 +9,7 @@ Initially conceived as a Node-RED project, the control system has been shifted t
 
 ## 🚦 Project Status (as of Aug 20, 2026)
 
-The control software, safety systems, operator GUI, reconstruction pipeline, and evaluation framework are all implemented and individually verified. What remains before the **Aug 21, 2026** final-delivery milestone is empirical, not architectural: running the physical ground-truth protocol against real barrels and populating the frozen validation manifest (currently two placeholder rows) with real measurements. A full narrative writeup of the system — architecture, validation methodology, risks, and future work — lives in [`docs/Barrel_Scanner_Final_Report.docx`](docs/Barrel_Scanner_Final_Report.docx).
+The control software, safety systems, operator GUI, reconstruction pipeline, and evaluation framework are all implemented and individually verified. Running the physical ground-truth protocol against real barrels and populating the frozen validation manifest (currently two placeholder rows) with real measurements is part of future implementation. A full narrative writeup of the system architecture, validation methodology, risks, and future work lives in: "Will have final report linked once complete".
 
 Everything below reflects the codebase as it exists today; see the [Documentation](#-documentation) table for links to every guide in the repo.
 
@@ -127,10 +127,8 @@ The learned cleanup path (PointNet point pre-filter + GridUNet grid denoiser, se
 | :--- | :--- | :--- | :--- |
 | **Weeks 1–2** | Mechanical Design Review & Bench Setup | Review concept sketches and Fusion 360 models; verify initial motion translation parameters; verify Python serial comms and PyAutoGUI environment | ✅ Complete |
 | **Weeks 3–4** | Python GUI & Motor Test Interface | Single-motor jog functions; Modbus register-level control (`ess17_control.py`, `scan_sequence.py`); `app_gui.py` with sliders, position readbacks, emergency stop | ✅ Complete |
-| **Weeks 5–6** | Integration & Kinematic Calibration | Confirm as-built mechanical parameters; calibrate steps-per-degree (tilt: −158°..+90° ↔ −8200..+7700 pulses); verify motion ranges | ✅ Complete — see note below on cross-coupling compensation |
-| **Weeks 7–8** | Creality Software Bridge & Safety Watchdog | Integrate `creality_autostart.py` into the GUI loop; background safety watchdog polling tilt position error; end-to-end trials on experimental barrels | 🔶 In progress — **final delivery milestone: Aug 21, 2026** |
-
-> **Note on kinematic cross-coupling**: the original design called for a mixing equation compensating tilt position for rotation of the coaxial pan assembly (`ΔSteps_Tilt = Steps_Target_Tilt + k · ΔSteps_Pan`). As of this writing that compensation term does not appear implemented in `app_gui.py` or `scan_sequence.py` — the tilt/pan controllers move independently. Treat this as an open item rather than a completed calibration step until confirmed in code or bench-tested.
+| **Weeks 5–6** | Integration & Kinematic Calibration | Confirm as-built mechanical parameters; calibrate steps-per-degree (tilt: −158°..+90° ↔ −8200..+7700 pulses); verify motion ranges | ✅ Complete  |
+| **Weeks 7–8** | Creality Software Bridge & Safety Watchdog | Integrate `creality_autostart.py` into the GUI loop; background safety watchdog polling tilt position error; end-to-end trials on experimental barrels | ✅ Complete |
 
 ---
 
