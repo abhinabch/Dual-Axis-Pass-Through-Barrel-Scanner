@@ -1,11 +1,23 @@
 import os
 import json
+import copy
 import logging
 from typing import Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "scan_config.json")
+
+# Valid cleanup modes for the reconstruction pipeline. "rules" is the hand-tuned,
+# production-default thresholding pipeline; "learned" is the PointNet + GridUNet
+# model-based cleanup path; "hybrid" uses the learned model only deep in the stave
+# wall and falls back to rules everywhere else (heads/poles/crozehead bevel) as a
+# bounded safety net. See docs/PROMOTION_RULE.md and
+# notebooks/05_rules_vs_learned_volume_accuracy.ipynb for accuracy comparisons --
+# as of that validation run, "learned" has NOT met the promotion bar and is
+# meaningfully less accurate than "rules" on synthetic ground truth; "hybrid" gets
+# close to rules' accuracy but is not shown to beat it outright.
+VALID_CLEANUP_MODES = ("rules", "learned", "hybrid")
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "motor_settings": {
@@ -27,6 +39,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "rot_deg": 1440.0,
         "rot_revs": 4.0,
         "pause_seconds": 1.0
+    },
+    "reconstruction_settings": {
+        "cleanup_mode": "rules"
     }
 }
 
@@ -36,7 +51,7 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
     Loads scan configuration from JSON file. If file is missing or corrupted,
     returns default configuration with missing keys populated.
     """
-    config = dict(DEFAULT_CONFIG)
+    config = copy.deepcopy(DEFAULT_CONFIG)
     if not os.path.exists(config_path):
         logger.warning(f"Config file not found at {config_path}. Creating default config.")
         save_config(config, config_path)
@@ -56,6 +71,20 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
             for k, v in data["sweep_settings"].items():
                 config["sweep_settings"][k] = v
 
+        # Merge reconstruction_settings
+        if "reconstruction_settings" in data and isinstance(data["reconstruction_settings"], dict):
+            for k, v in data["reconstruction_settings"].items():
+                config["reconstruction_settings"][k] = v
+
+        # Validate cleanup_mode; fall back to the safe default if the config file
+        # has an unrecognized value (e.g. hand-edited or from an older version).
+        if config["reconstruction_settings"].get("cleanup_mode") not in VALID_CLEANUP_MODES:
+            logger.warning(
+                "Invalid reconstruction cleanup_mode %r in config; defaulting to 'rules'.",
+                config["reconstruction_settings"].get("cleanup_mode"),
+            )
+            config["reconstruction_settings"]["cleanup_mode"] = "rules"
+
         # Keep rot_deg and rot_revs synchronized
         rot_pulses_per_rev = config["motor_settings"].get("rot_pulses_per_rev", 10000)
         if "rot_revs" in config["sweep_settings"]:
@@ -65,7 +94,7 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
 
     except Exception as e:
         logger.error(f"Error reading config file {config_path}: {e}. Returning default config.")
-        config = dict(DEFAULT_CONFIG)
+        config = copy.deepcopy(DEFAULT_CONFIG)
 
     return config
 
@@ -95,7 +124,7 @@ def reset_to_defaults(config_path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
     """
     Resets the configuration file to default settings.
     """
-    defaults = dict(DEFAULT_CONFIG)
+    defaults = copy.deepcopy(DEFAULT_CONFIG)
     save_config(defaults, config_path)
     return defaults
 

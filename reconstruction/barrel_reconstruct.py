@@ -64,9 +64,18 @@ POLAR_DECIMATE = True      # halve azimuth resolution toward the poles so the fl
                            # heads don't get a 720-spoke pole pinch (radial-line artifact)
 HEAD_POLE_MARGIN_DEG = 3.0 # keep flat-head extrapolation this far inside the crozehead
                            # corner when estimating each head plane (flatten_head_poles)
+HYBRID_WALL_MARGIN_DEG = 30.0  # 'hybrid' cleanup mode: only trust the learned GridUNet
+                           # this far (deg of el) inside each crozehead corner. Empirically,
+                           # the model's head/pole collapse (see notebooks/05_..._accuracy.ipynb)
+                           # bleeds into the crozehead bevel transition too, not just the true
+                           # empty head/pole rows -- a hard cutoff at the corner angle leaves a
+                           # ~150mm seam there. Rules' full pipeline is used everywhere outside
+                           # this margin (heads, poles, and the bevel band on both sides).
 WRITE_STL   = True         # also emit a binary STL beside each PLY
 STL_UNITS_MM = False       # True: scale STL metres->mm (endcap_metrics.py expects mm); False: keep metres
-CLEANUP_MODE = "rules"     # 'rules' (baseline thresholding) or 'learned' (PointNet + U-Net)
+CLEANUP_MODE = "rules"     # 'rules' (baseline thresholding), 'learned' (PointNet + U-Net),
+                           # or 'hybrid' (learned wall denoising + rules' flat-head pole
+                           # extrapolation/bung detection -- see reconstruct_one() below)
 
 
 # ── Load ───────────────────────────────────────────────────────────────────────
@@ -561,16 +570,24 @@ def out_path(tag, ext, stem, out_dir=None):
     return os.path.join(d, "%s_barrel_%s.%s" % (stem, tag, ext))
 
 
-def run_reconstruction_pipeline(src, cleanup_mode=None, out_dir=None):
-    """Wrapper for reconstruct_one to be used as a pipeline entry point."""
-    return reconstruct_one(src, cleanup_mode=cleanup_mode, out_dir=out_dir)
+def run_reconstruction_pipeline(src, cleanup_mode=None, out_dir=None, learned_checkpoint=None):
+    """Wrapper for reconstruct_one to be used as a pipeline entry point.
 
-def reconstruct_one(src, cleanup_mode=None, out_dir=None):
+    learned_checkpoint: optional path to a GridUNet .pt checkpoint to use instead of
+    barrel_denoise_grid.DEFAULT_CHECKPOINT (models/grid_denoiser_best.pt), for both
+    'learned' and 'hybrid' cleanup modes. Lets a candidate checkpoint be A/B tested
+    against the production one without overwriting/renaming any files.
+    """
+    return reconstruct_one(src, cleanup_mode=cleanup_mode, out_dir=out_dir,
+                           learned_checkpoint=learned_checkpoint)
+
+def reconstruct_one(src, cleanup_mode=None, out_dir=None, learned_checkpoint=None):
     """Reconstruct one .obscan; write <stem>_barrel_clean/axisym.ply to OUT_DIR or custom out_dir.
     Returns a summary dict."""
     if cleanup_mode is None:
-        cleanup_mode = CLEANUP_MODE    
-    # Use provided out_dir if available, otherwise fall back to global OUT_DIR    base_out = out_dir if out_dir is not None else OUT_DIR
+        cleanup_mode = CLEANUP_MODE
+    # Use provided out_dir if available, otherwise fall back to global OUT_DIR
+    base_out = out_dir if out_dir is not None else OUT_DIR
 
     stem = os.path.splitext(os.path.basename(src))[0]
     print("\n" + "=" * 70)
@@ -588,18 +605,18 @@ def reconstruct_one(src, cleanup_mode=None, out_dir=None):
     print("  wall points %d (%.1f%%), head points %d (%.1f%%)"
           % (n_wall, 100 * n_wall / len(P), len(P) - n_wall, 100 * (len(P) - n_wall) / len(P)))
 
-    # Phase 3 PointNet Pre-binning point filter (learned mode only)
-    if cleanup_mode == "learned":
+    # Phase 3 PointNet Pre-binning point filter (learned + hybrid modes)
+    if cleanup_mode in ("learned", "hybrid"):
         try:
             from barrel_denoise_points import filter_points_pre_binning
             keep_mask, pt_probs = filter_points_pre_binning(P, N)
             P = P[keep_mask]
             N = N[keep_mask]
             naxis = naxis[keep_mask]
-            print("  [learned] PointNet pre-binning filter: kept %d / %d points (dropped %d)" %
-                  (len(P), len(keep_mask), len(keep_mask) - len(P)))
+            print("  [%s] PointNet pre-binning filter: kept %d / %d points (dropped %d)" %
+                  (cleanup_mode, len(P), len(keep_mask), len(keep_mask) - len(P)))
         except Exception as exc:
-            print("  [learned] PointNet pre-binning filter skipped: %s" % exc)
+            print("  [%s] PointNet pre-binning filter skipped: %s" % (cleanup_mode, exc))
 
     # centre the spherical map at the mid-length point on the axis
     mid = centre + (z.mean()) * a
@@ -620,12 +637,60 @@ def reconstruct_one(src, cleanup_mode=None, out_dir=None):
         try:
             from barrel_denoise_grid import learned_clean_grid
             cnt = build_rho_grid(az, el, rho, N_AZ, el_edges)[1]
-            clean, bung_mask = learned_clean_grid(grid, cnt, corners, el_ctr)
+            ckpt_kwargs = {'checkpoint_path': learned_checkpoint} if learned_checkpoint else {}
+            clean, bung_mask = learned_clean_grid(grid, cnt, corners, el_ctr, **ckpt_kwargs)
             bad = bung_mask | np.isnan(grid)
             info = {"bung_cells": int(bung_mask.sum())}
             print("  [learned] GridUNet clean grid complete (bung cells: %d)" % info["bung_cells"])
         except Exception as exc:
             print("  [learned] GridUNet fallback to rules due to error: %s" % exc)
+            cleanup_mode = "rules"
+
+    if cleanup_mode == "hybrid":
+        # Combine the two pipelines by region, as a bounded safety net rather than an
+        # attempt to beat rules outright: run rules' FULL pipeline everywhere (flat-head
+        # extrapolation, bung detection, gross-outlier rejection, fill, smooth) as the
+        # trustworthy baseline, then overlay the learned GridUNet's prediction only deep
+        # in the stave wall, safely clear of the crozehead bevel transition on both sides
+        # (empirically, learned's head/pole collapse bleeds several degrees into what a
+        # hard corner-angle cutoff would call "wall", leaving a large seam there -- see
+        # HYBRID_WALL_MARGIN_DEG above and notebooks/05_rules_vs_learned_volume_accuracy.ipynb).
+        # Measured on synthetic ground truth, this keeps hybrid close to rules' accuracy
+        # instead of learned's ~31% mean volume error; it is NOT shown to beat rules
+        # outright, so treat it as a way to safely explore learned-mode involvement rather
+        # than a proven accuracy upgrade.
+        try:
+            from barrel_denoise_grid import learned_clean_grid
+            cnt = build_rho_grid(az, el, rho, N_AZ, el_edges)[1]
+            ckpt_kwargs = {'checkpoint_path': learned_checkpoint} if learned_checkpoint else {}
+            learned_grid, _learned_bung_mask = learned_clean_grid(grid, cnt, corners, el_ctr, **ckpt_kwargs)
+
+            rules_grid, n_pole_fixed = flatten_head_poles(grid, el_ctr, corners)
+            bung_mask, info = detect_bung(rules_grid, BUNG_SEED_MM, MIN_BUNG_CELLS, el_ctr,
+                                          corners, int(BUNG_MAX_AZ_DEG / 360.0 * N_AZ))
+            if info.get("bung_cells"):
+                print("  bung: %d cells at el=%.1f deg, az=%.1f deg (span %.0f deg; clusters %s)"
+                      % (info["bung_cells"], info["el_deg"], info["az_deg"],
+                         info["az_span_deg"], info["sizes"]))
+            else:
+                why = "ring feature rejected" if info.get("rejected_ring") else "none over threshold"
+                print("  bung: %s (seed clusters %s)" % (why, info.get("sizes")))
+            med_r, _ = _row_median_mad(rules_grid)
+            gross = np.isfinite(rules_grid) & (np.abs(rules_grid - med_r[:, None]) > GROSS_OUTLIER_MM / 1000.0)
+            print("  gross outlier cells rejected: %d" % int(gross.sum()))
+            bad = bung_mask | np.isnan(rules_grid) | gross
+            rules_clean = fill_grid(rules_grid, bad)
+            rules_clean = smooth_grid(rules_clean, el_ctr, corners, SMOOTH_PASSES)
+
+            margin = np.deg2rad(HYBRID_WALL_MARGIN_DEG)
+            safe_wall = (el_ctr > corners[0] + margin) & (el_ctr < corners[1] - margin)
+            clean = np.where(safe_wall[:, None], learned_grid, rules_clean)
+            clean = smooth_grid(clean, el_ctr, corners, SMOOTH_PASSES)  # blend the seam
+            print("  [hybrid] learned deep-wall rows (%d) + rules elsewhere "
+                  "(heads/poles/bevel; %d pole cells flat-head-fixed)"
+                  % (int(safe_wall.sum()), n_pole_fixed))
+        except Exception as exc:
+            print("  [hybrid] fallback to rules due to error: %s" % exc)
             cleanup_mode = "rules"
 
     if cleanup_mode == "rules":

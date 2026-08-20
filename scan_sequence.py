@@ -41,17 +41,29 @@ IDM57_RELATIVE_MOVE_WORD = (1 << 0) | (1 << 6) # 0x0041 (Relative Position Move)
 
 
 class ModbusLink:
-    def __init__(self, port='COM3', baudrate=115200):
+    def __init__(self, port='COM3', baudrate=115200, client=None):
+        """
+        Thin register-access wrapper used by the scan sequence.
+
+        If `client` is provided (an already-constructed pymodbus client, e.g. the
+        one the GUI keeps open for status polling / jogging / the safety watchdog),
+        it is reused instead of opening a second connection on the same serial
+        port -- opening two independent handles to the same COM port will fail or
+        fight each other.
+        """
         self.port = port
         self.baudrate = baudrate
-        self.client = ModbusClient(
-            port=self.port,
-            baudrate=self.baudrate,
-            parity='N',
-            stopbits=1,
-            bytesize=8,
-            timeout=2.0
-        )
+        if client is not None:
+            self.client = client
+        else:
+            self.client = ModbusClient(
+                port=self.port,
+                baudrate=self.baudrate,
+                parity='N',
+                stopbits=1,
+                bytesize=8,
+                timeout=2.0
+            )
 
     def connect(self):
         if not self.client.connect():

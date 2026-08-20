@@ -221,7 +221,7 @@ class SafetyWatchdog:
     Background thread that polls motor positions and alarms to detect stalls or faults.
     If a fault is detected, it calls the provided callback to trigger the Error screen.
     """
-    def __init__(self, client: ModbusSerialClient, callback: Callable[[], None], poll_interval: float = 0.5):
+    def __init__(self, client: ModbusSerialClient, callback: Callable[[Exception], None], poll_interval: float = 0.5):
         self.client = client
         self.callback = callback
         self.poll_interval = poll_interval
@@ -239,7 +239,7 @@ class SafetyWatchdog:
     def stop(self):
         self._running = False
         if self._stop_event:
-            self._stop_event().set()
+            self._stop_event.set()
         log.info("SafetyWatchdog stopped.")
 
     def _run(self):
@@ -249,14 +249,14 @@ class SafetyWatchdog:
                 pan_status = read_motor_status(self.client, UNIT_ID_PAN)
                 if pan_status["faulty"]:
                     log.error("SafetyWatchdog: Pan axis fault detected!")
-                    self.callback()
+                    self.callback(PipelineError("Pan axis motor fault detected by safety watchdog."))
                     break
-                
+
                 # Check Tilt Axis
                 tilt_status = read_motor_status(self.client, UNIT_ID_TILT)
                 if tilt_status["faulty"]:
                     log.error("SafetyWatchdog: Tilt axis fault detected!")
-                    self.callback()
+                    self.callback(PipelineError("Tilt axis motor fault detected by safety watchdog."))
                     break
                 
             except Exception as e:
