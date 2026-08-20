@@ -5,6 +5,9 @@ import queue
 import time
 import logging
 import math
+import os
+import csv
+from datetime import datetime
 from enum import Enum, auto
 from typing import Optional, Callable, List
 
@@ -355,7 +358,6 @@ class TiltProtractorWidget(ctk.CTkFrame):
         self.draw_dial()
 
 # Backend imports
-from pymodbus.client import ModbusSerialClient
 from hardware.run_precision_scan import (
     ModbusSerialClient,
     UNIT_ID_PAN,
@@ -363,9 +365,13 @@ from hardware.run_precision_scan import (
     SERIAL_PORT,
     BAUDRATE,
     TIMEOUT,
+    PULSES_PER_REV_PAN,
+    PULSES_PER_REV_TILT,
     read_motor_status,
     check_motor_alarm,
     emergency_stop,
+    send_absolute_move,
+    read_encoder_position,
     SafetyWatchdog,
     # perform_raster_sweep, # Removed in favor of scan_sequence
     PipelineError
@@ -379,7 +385,8 @@ from config_manager import (
     save_config,
     reset_to_defaults,
     parse_tilt_targets_str,
-    tilt_targets_to_str
+    tilt_targets_to_str,
+    VALID_CLEANUP_MODES
 )
 
 # Setup logging
@@ -413,10 +420,12 @@ class AppGUI(ctk.CTk):
         # --- Backend State ---
         self._app_state = AppState.READY
         self.client: Optional[ModbusSerialClient] = None
+        self.link: Optional[ModbusLink] = None
         self.watchdog: Optional[SafetyWatchdog] = None
         self.automator = CrealityAutomator()
         self.worker_queue = queue.Queue()
         self.stop_event = threading.Event()
+        self.last_results: Optional[dict] = None
 
         # Config state
         self.scan_config = load_config()
@@ -812,20 +821,37 @@ class AppGUI(ctk.CTk):
         self.error_title.configure(text="Scan Halted")
         self.error_msg.configure(text="The scan was stopped by the operator. Please decide whether to save the partial data in the technician panel.")
 
-    def handle_pipeline_error(self, error):
-        log.error(f"Pipeline Error: {error}")
-        self.show_frame(AppState.ERROR)
-        self.error_msg.configure(text=str(error))
+    def _watchdog_fault_callback(self, error):
+        """
+        SafetyWatchdog polls hardware registers on a background thread. Tk widgets may
+        only be touched from the main thread, so route the fault through the same
+        worker_queue / process_queue path the pipeline worker uses instead of calling
+        handle_pipeline_error() directly from that thread.
+        """
+        self.worker_queue.put(WorkerMessage('error', error=error))
 
     def start_pipeline(self):
         """Launch the background worker for the scan pipeline."""
+        if self.client is None or self.link is None:
+            self.handle_pipeline_error(PipelineError(
+                "Motor link is not connected. Run System Check before starting a scan."
+            ))
+            return
+
         self.stop_event.clear()
         self.show_frame(AppState.SCANNING)
-        
+        self.scan_progress_bar.set(0)
+        self.scan_progress_lbl.configure(text="Initializing...")
+
+        # Start the elapsed-time timer here (on the main/Tk thread) rather than from the
+        # background worker -- Tk widgets must only be touched from the main thread.
+        self.start_time = time.time()
+        self.update_timer_loop()
+
         # Start Safety Watchdog
-        self.watchdog = SafetyWatchdog(self.client, self.handle_pipeline_error)
+        self.watchdog = SafetyWatchdog(self.client, self._watchdog_fault_callback)
         self.watchdog.start()
-        
+
         # Launch Worker
         threading.Thread(target=self.pipeline_worker, daemon=True).start()
 
@@ -835,10 +861,9 @@ class AppGUI(ctk.CTk):
             # 1. Scanning Phase
             def progress_cb(msg):
                 self.worker_queue.put(WorkerMessage('progress', data=msg))
-            
-            # Start timer
-            self.start_time = time.time()
-            self.update_timer_loop()
+
+            if self.link is None:
+                raise PipelineError("Motor link is not connected. Cannot run scan sequence.")
 
             # Trigger Creality Scan autostart sequence
             log.info("Triggering Creality Scan autostart sequence...")
@@ -847,10 +872,12 @@ class AppGUI(ctk.CTk):
             except Exception as scan_err:
                 log.warning("Creality Scan autostart note: %s", scan_err)
 
-            # Execute the raster sweep using scan_sequence.py
-            # We use the link already established in the GUI and configured scan settings
-            run_scan_sequence(self.client, config=self.scan_config, progress_callback=progress_cb)
-            
+            # Execute the raster sweep using scan_sequence.py. Note: this needs the
+            # ModbusLink wrapper (self.link), NOT the raw pymodbus client (self.client) --
+            # ESS17Controller/IDM57Controller call link.read_reg()/write_reg()/write_regs(),
+            # which the raw ModbusSerialClient does not implement.
+            run_scan_sequence(self.link, config=self.scan_config, progress_callback=progress_cb)
+
             # Stop scan in scanner UI
             try:
                 self.automator.stop_scan()
@@ -860,7 +887,7 @@ class AppGUI(ctk.CTk):
             # 2. Processing Phase
             self.worker_queue.put(WorkerMessage('status', data='processing'))
             self.after(0, lambda: self.show_frame(AppState.PROCESSING))
-            
+
             # Export scan file via CrealityAutomator
             barrel_id_str = self.barrel_id.get().strip() if self.barrel_id.get() else "default"
             try:
@@ -870,31 +897,73 @@ class AppGUI(ctk.CTk):
                 scan_file_path = "saved_creality_files/fallback.obscan"
 
             log.info("Scan output recorded at: %s", scan_file_path)
-            
-            # Simulation of reconstruction pipeline
-            # results = run_reconstruction_pipeline(scan_file_path)
-            time.sleep(3) # Simulate processing time
-            
-            # Mock results based on the requested schema
-            mock_results = {
-                'volume': 225.5, 
-                'surface': 6.2, 
-                'quality': 'Good', 
-                'metrics': {'Axial Length': '850mm', 'Bilge Radius': '310mm'}
-            }
-            
-            # 3. Results Phase
-            self.worker_queue.put(WorkerMessage('result', data=mock_results))
-            
+
+            # 3. Reconstruction Phase -- run the real volume/surface pipeline on the
+            # exported .obscan file and translate its result schema into what the
+            # Results screen expects.
+            progress_cb("Running 3D reconstruction pipeline (this can take a minute)...")
+            cleanup_mode = self.scan_config.get("reconstruction_settings", {}).get("cleanup_mode", "rules")
+            try:
+                recon_result = run_reconstruction_pipeline(scan_file_path, cleanup_mode=cleanup_mode)
+            except Exception as recon_err:
+                raise PipelineError(f"Reconstruction failed for '{scan_file_path}': {recon_err}") from recon_err
+
+            results_payload = self._translate_reconstruction_result(recon_result)
+
+            # 4. Results Phase
+            self.worker_queue.put(WorkerMessage('result', data=results_payload))
+
         except Exception as e:
             self.worker_queue.put(WorkerMessage('error', error=e))
         finally:
             if self.watchdog:
                 self.watchdog.stop()
 
+    def _translate_reconstruction_result(self, recon_result: dict) -> dict:
+        """
+        Convert the raw summary dict returned by reconstruction.barrel_reconstruct's
+        run_reconstruction_pipeline() (shaped like {"clean": {"vol_L", "area",
+        "watertight", ...}, "axisym": {...}, "fidelity_rms", "asym_rms", "bung", ...})
+        into the {'volume', 'surface', 'quality', 'metrics'} schema handle_results() /
+        the Results screen expect.
+        """
+        clean = recon_result.get("clean", {}) if recon_result else {}
+        volume_l = clean.get("vol_L")
+        area_m2 = clean.get("area")
+        watertight = clean.get("watertight", False)
+        fidelity_rms = recon_result.get("fidelity_rms") if recon_result else None
+
+        quality = "Good"
+        if not watertight:
+            quality = "Review"
+        elif fidelity_rms is not None and fidelity_rms > 2.0:
+            quality = "Review"
+
+        metrics = {}
+        if recon_result:
+            if recon_result.get("length") is not None:
+                metrics["Axial Length"] = f"{recon_result['length'] * 1000:.0f}mm"
+            if fidelity_rms is not None:
+                metrics["Fidelity RMS"] = f"{fidelity_rms:.2f}mm"
+            if recon_result.get("asym_rms") is not None:
+                metrics["Asymmetry RMS"] = f"{recon_result['asym_rms']:.2f}mm"
+            if recon_result.get("bung"):
+                metrics["Bung Cells"] = str(recon_result["bung"])
+            if clean.get("v") is not None and clean.get("f") is not None:
+                metrics["Mesh"] = f"{clean['v']}v / {clean['f']}f"
+            metrics["Watertight"] = "Yes" if watertight else "No"
+
+        return {
+            'volume': round(volume_l, 2) if isinstance(volume_l, (int, float)) else '--',
+            'surface': round(area_m2, 3) if isinstance(area_m2, (int, float)) else '--',
+            'quality': quality,
+            'metrics': metrics,
+            'raw': recon_result,
+        }
+
     def update_timer_loop(self):
         """Update the elapsed time label on the Scanning screen."""
-        if self.state == AppState.SCANNING:
+        if self._app_state == AppState.SCANNING:
             elapsed = int(time.time() - self.start_time)
             mins, secs = divmod(elapsed, 60)
             self.timer_lbl.configure(text=f"Elapsed Time: {mins:02d}:{secs:02d}")
@@ -903,6 +972,7 @@ class AppGUI(ctk.CTk):
 
     def handle_results(self, data):
         # data is expected to be a dict: {'volume': float, 'surface': float, 'quality': str, 'metrics': dict}
+        self.last_results = data
         self.res_volume.configure(text=f"{data.get('volume', '--')} L")
         self.res_vol_gal.configure(text=f"{ (data.get('volume', 0) * 0.264172 if isinstance(data.get('volume'), (int, float)) else '--') } gal")
         self.res_surface.configure(text=f"{data.get('surface', '--')} m²")
@@ -927,45 +997,84 @@ class AppGUI(ctk.CTk):
         self.show_frame(AppState.RESULTS)
 
     def save_results_to_log(self):
-        """Interface with barrel_batch.py to save the current result."""
+        """Persist the current scan results to a CSV log on disk (and the text log)."""
+        if not self.last_results:
+            log.warning("No results available to save yet.")
+            return
+
         log.info("Saving results to log...")
-        # In a real implementation:
-        # save_to_log(barrel_id=self.barrel_id.get(), operator=self.operator_name.get(), results=...)
-        self.save_log_btn.configure(text="Saved!", state="disabled", fg_color="green")
-        self.after(2000, lambda: self.save_log_btn.configure(text="Save & Add to Log", state="normal", fg_color=["#3a7ebf", "#1f538d"]))
+        data = self.last_results
+        try:
+            log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_results_log.csv")
+            file_exists = os.path.exists(log_path)
+            with open(log_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(["timestamp", "barrel_id", "operator", "volume_L", "surface_m2", "quality"])
+                writer.writerow([
+                    datetime.now().isoformat(timespec="seconds"),
+                    self.barrel_id.get(),
+                    self.operator_name.get(),
+                    data.get("volume"),
+                    data.get("surface"),
+                    data.get("quality"),
+                ])
+
+            save_to_log(
+                f"Saved scan for barrel '{self.barrel_id.get()}' by "
+                f"'{self.operator_name.get()}': {data.get('volume')} L, "
+                f"{data.get('surface')} m^2, quality={data.get('quality')}"
+            )
+
+            self.save_log_btn.configure(text="Saved!", state="disabled", fg_color="green")
+            self.after(2000, lambda: self.save_log_btn.configure(text="Save & Add to Log", state="normal", fg_color=["#3a7ebf", "#1f538d"]))
+        except Exception as e:
+            log.error("Failed to save results to log: %s", e)
+            self.save_log_btn.configure(text="Save Failed", fg_color="red")
+            self.after(2500, lambda: self.save_log_btn.configure(text="Save & Add to Log", state="normal", fg_color=["#3a7ebf", "#1f538d"]))
 
     def jog_axis(self, unit_id: int, revs: int):
         """Manual jog for technician panel."""
         log.info("Jogging axis %d by %d revs", unit_id, revs)
+        if not self.client:
+            log.warning("Jog ignored: motor client is not connected.")
+            return
         try:
-            if self.client:
-                # Use relative move for jogging
-                # Need a relative move function in run_precision_scan or implement here
-                # For simplicity, we'll call a temporary helper
-                from hardware.run_precision_scan import send_absolute_move
-                # This is a hack; proper relative move should be in hardware module
-                # Assuming current position + offset
-                from hardware.run_precision_scan import read_encoder_position
-                curr = read_encoder_position(self.client, unit_id)
-                target = curr + (revs * (PULSES_PER_REV_PAN if unit_id == UNIT_ID_PAN else PULSES_PER_REV_TILT))
-                send_absolute_move(self.client, unit_id, target)
+            pulses_per_rev = PULSES_PER_REV_PAN if unit_id == UNIT_ID_PAN else PULSES_PER_REV_TILT
+            curr = read_encoder_position(self.client, unit_id)
+            target = curr + (revs * pulses_per_rev)
+            send_absolute_move(self.client, unit_id, target)
         except Exception as e:
             log.error("Jog failed: %s", e)
 
-    def apply_settings(self):
-        """Update Modbus client settings."""
-        new_port = self.port_entry.get()
-        new_baud = int(self.baud_entry.get())
-        log.info("Applying settings: Port=%s, Baud=%d", new_port, new_baud)
-        # Re-initialize client
+    def _init_modbus_client(self, port: str, baud: int) -> bool:
+        """
+        (Re)initialize the shared Modbus client used for status polling, jogging, and
+        the safety watchdog, plus the ModbusLink wrapper the scan sequence needs.
+        The link reuses the same underlying connection -- opening a second handle to
+        the same serial port would fail or contend with the first.
+        """
         if self.client:
-            self.client.close()
-        self.client = ModbusSerialClient(port=new_port, baudrate=new_baud, timeout=TIMEOUT)
-        self.client.connect()
+            try:
+                self.client.close()
+            except Exception:
+                pass
+
+        self.client = ModbusSerialClient(port=port, baudrate=baud, timeout=TIMEOUT)
+        connected = self.client.connect()
+        self.link = ModbusLink(port=port, baudrate=baud, client=self.client)
+        return connected
+
+    def apply_settings(self):
+        """Update Modbus client settings from the Technician panel fields."""
+        new_port = self.port_entry.get().strip()
+        new_baud = int(self.baud_entry.get().strip())
+        log.info("Applying settings: Port=%s, Baud=%d", new_port, new_baud)
+        self._init_modbus_client(new_port, new_baud)
 
     def manual_reconstruct(self):
-        """Run reconstruction on a specific file."""
-        path = self.file_path_entry.get()
+        """Run reconstruction on a specific file, entered by a technician."""
+        path = self.file_path_entry.get().strip()
         if not path:
             log.warning("No path provided for manual reconstruction.")
             return
@@ -974,13 +1083,14 @@ class AppGUI(ctk.CTk):
         self.show_frame(AppState.PROCESSING)
         threading.Thread(target=self.manual_reconstruct_worker, args=(path,), daemon=True).start()
 
-    def manual_reconstruct_worker(self):
+    def manual_reconstruct_worker(self, path: str):
         try:
-            # simulate reconstruction
-            time.sleep(3)
-            self.worker_queue.put(WorkerMessage('result', data={'volume': 210.2, 'surface': 5.8, 'quality': 'Good'}))
+            cleanup_mode = self.scan_config.get("reconstruction_settings", {}).get("cleanup_mode", "rules")
+            recon_result = run_reconstruction_pipeline(path, cleanup_mode=cleanup_mode)
+            results_payload = self._translate_reconstruction_result(recon_result)
+            self.worker_queue.put(WorkerMessage('result', data=results_payload))
         except Exception as e:
-            self.worker_queue.put(WorkerMessage('error', error=str(e)))
+            self.worker_queue.put(WorkerMessage('error', error=e))
 
     def poll_connections(self):
         """Periodically check connection status of turret and scanner."""
@@ -990,10 +1100,14 @@ class AppGUI(ctk.CTk):
         turret_ok = False
         try:
             if self.client is None:
-                # Try to initialize client if it doesn't exist
-                self.client = ModbusSerialClient(port=SERIAL_PORT, baudrate=BAUDRATE, timeout=TIMEOUT)
-                self.client.connect()
-            
+                # Try to initialize client if it doesn't exist, using the configured
+                # port/baud from scan_config.json (falls back to hardware defaults).
+                m_cfg = self.scan_config.get("motor_settings", {})
+                self._init_modbus_client(
+                    m_cfg.get("port", SERIAL_PORT),
+                    m_cfg.get("baudrate", BAUDRATE),
+                )
+
             if self.client.connected:
                 # Try to read a status register to verify actual communication
                 status = read_motor_status(self.client, UNIT_ID_PAN)
@@ -1146,6 +1260,29 @@ class AppGUI(ctk.CTk):
         self.tilt_targets_entry = ctk.CTkEntry(raw_frame, width=650, placeholder_text="-8000, -4000, 0, 2000, 5000")
         self.tilt_targets_entry.pack(anchor="w", fill="x")
 
+        # Row 5: Reconstruction Cleanup Mode (rules-based vs model-based/learned)
+        cleanup_container = ctk.CTkFrame(config_box, fg_color="transparent")
+        cleanup_container.pack(fill="x", padx=20, pady=(5, 10))
+
+        ctk.CTkLabel(cleanup_container, text="Reconstruction Cleanup Mode:", font=("Roboto", 14, "bold")).pack(anchor="w", padx=10, pady=(5, 2))
+
+        cleanup_row = ctk.CTkFrame(cleanup_container, fg_color="transparent")
+        cleanup_row.pack(anchor="w", padx=10, pady=(0, 2))
+
+        self.cleanup_mode_var = tk.StringVar(value="rules")
+        self.cleanup_mode_menu = ctk.CTkOptionMenu(
+            cleanup_row,
+            values=list(VALID_CLEANUP_MODES),
+            variable=self.cleanup_mode_var,
+            width=160,
+            command=self._on_cleanup_mode_change,
+        )
+        self.cleanup_mode_menu.pack(side="left")
+
+        self.cleanup_mode_note_lbl = ctk.CTkLabel(cleanup_container, text="", font=("Roboto", 11), text_color="gray", justify="left")
+        self.cleanup_mode_note_lbl.pack(anchor="w", padx=10, pady=(2, 5))
+        self._update_cleanup_mode_note()
+
         # Config Buttons & Status
         cfg_btn_row = ctk.CTkFrame(config_box, fg_color="transparent")
         cfg_btn_row.pack(pady=10)
@@ -1200,6 +1337,36 @@ class AppGUI(ctk.CTk):
             self.tilt_targets_entry.delete(0, "end")
             self.tilt_targets_entry.insert(0, tilt_targets_to_str(pulses))
 
+    def _on_cleanup_mode_change(self, _value: str = None):
+        """Called when the technician changes the reconstruction cleanup mode dropdown."""
+        self._update_cleanup_mode_note()
+
+    def _update_cleanup_mode_note(self):
+        """Refresh the advisory note under the cleanup mode dropdown based on current selection."""
+        if not hasattr(self, "cleanup_mode_note_lbl"):
+            return
+        mode = self.cleanup_mode_var.get() if hasattr(self, "cleanup_mode_var") else "rules"
+        if mode == "learned":
+            self.cleanup_mode_note_lbl.configure(
+                text=("⚠ Model-based (learned) cleanup is experimental. Validation on synthetic "
+                      "barrels (notebooks/05_rules_vs_learned_volume_accuracy.ipynb) showed ~31% mean "
+                      "volume error vs ~4% for Rules mode -- do not use for production volume reporting "
+                      "until this is resolved."),
+                text_color="#d9822b",
+            )
+        elif mode == "hybrid":
+            self.cleanup_mode_note_lbl.configure(
+                text=("Uses the learned model only deep in the stave wall and falls back to Rules "
+                      "everywhere else (heads/poles/bevel) as a safety net. Gets close to Rules' "
+                      "accuracy but is not shown to beat it -- see notebooks/05_rules_vs_learned_volume_accuracy.ipynb."),
+                text_color="#2f6fed",
+            )
+        else:
+            self.cleanup_mode_note_lbl.configure(
+                text="Rules mode is the validated production default (see notebooks/05_rules_vs_learned_volume_accuracy.ipynb).",
+                text_color="gray",
+            )
+
     def populate_gui_config_fields(self):
         """Populate GUI entries from current self.scan_config."""
         m_cfg = self.scan_config.get("motor_settings", {})
@@ -1246,6 +1413,15 @@ class AppGUI(ctk.CTk):
         if hasattr(self, "tilt_protractor"):
             self.tilt_protractor.set_pulses(targets)
 
+        r_cfg = self.scan_config.get("reconstruction_settings", {})
+        cleanup_mode = r_cfg.get("cleanup_mode", "rules")
+        if cleanup_mode not in VALID_CLEANUP_MODES:
+            cleanup_mode = "rules"
+
+        if hasattr(self, "cleanup_mode_var"):
+            self.cleanup_mode_var.set(cleanup_mode)
+            self._update_cleanup_mode_note()
+
     def save_gui_config(self):
         """Save input values from GUI into self.scan_config and write to scan_config.json."""
         try:
@@ -1271,8 +1447,14 @@ class AppGUI(ctk.CTk):
             if parsed_targets:
                 s_cfg["tilt_targets_pulses"] = parsed_targets
 
+            r_cfg = self.scan_config.get("reconstruction_settings", {})
+            if hasattr(self, "cleanup_mode_var"):
+                selected_mode = self.cleanup_mode_var.get().strip()
+                r_cfg["cleanup_mode"] = selected_mode if selected_mode in VALID_CLEANUP_MODES else "rules"
+
             self.scan_config["motor_settings"] = m_cfg
             self.scan_config["sweep_settings"] = s_cfg
+            self.scan_config["reconstruction_settings"] = r_cfg
 
             if save_config(self.scan_config):
                 self.cfg_status_lbl.configure(text="✔ Configuration saved to scan_config.json", text_color="green")

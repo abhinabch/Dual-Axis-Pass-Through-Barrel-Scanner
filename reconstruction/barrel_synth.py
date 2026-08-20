@@ -55,10 +55,24 @@ _NOISE_RMS_MM = 1.5
 
 # ── Profile interpolation ─────────────────────────────────────────────────────
 
-def _interp_profile(z_m, span_m, r_crozehead_m, r_bilge_m, rng):
+def _interp_profile(z_m, span_m, r_crozehead_m, r_bilge_m, profile_perturb_m):
     """Interpolate the calibration profile to arbitrary barrel dimensions.
     `z_m` are axial positions (metres) relative to barrel midpoint.
-    Returns radius (m) at each z."""
+    Returns radius (m) at each z.
+
+    `profile_perturb_m` must be the SAME fixed per-barrel perturbation array
+    (drawn once in generate_barrel_params) on every call. This function used to
+    draw a fresh `rng.normal(...)` sample on every call instead -- since it is
+    called several times per barrel with nearly-identical `z_m` (e.g. the
+    finite-difference normal estimation in generate_clean_cloud calls it at
+    el, el+deps, el-deps for deps=1e-4), that meant the interpolated profile
+    "jumped" by a fresh independent random amount between calls that differed
+    by a fraction of a millimetre in z. Any finite difference computed from
+    those calls (i.e. every surface normal) was then dominated by that
+    uncorrelated per-call noise divided by the tiny deps, not by the actual
+    barrel geometry -- corrupting wall vs. head normal classification
+    (AXIS_NORMAL_SPLIT) for the majority of wall points.
+    """
     half = span_m / 2.0
     # Map z to the normalized 0–1 range (crozebevel to crozebevel)
     t = (z_m + half) / span_m
@@ -75,9 +89,9 @@ def _interp_profile(z_m, span_m, r_crozehead_m, r_bilge_m, rng):
     b = r_crozehead_m - a * cal_crozehead
     r_scaled = a * r_cal + b
 
-    # Per-barrel random perturbation (within observed cross-barrel std)
-    perturb = rng.normal(0, _PROFILE_STD_MM / 1000.0 * 0.5)  # half std
-    r_scaled = r_scaled + perturb
+    # Per-barrel random perturbation (within observed cross-barrel std), fixed
+    # once per barrel so repeated/nearby-z calls stay self-consistent.
+    r_scaled = r_scaled + profile_perturb_m
 
     # Interpolate
     return np.interp(t, t_cal, r_scaled)
@@ -123,7 +137,7 @@ def _barrel_profile(el, params):
     span_m = params["span_m"]
     r_crozehead_m = params["r_crozehead_m"]
     r_bilge_m = params["r_bilge_m"]
-    rng = params["rng"]
+    profile_perturb_m = params["profile_perturb_m"]
 
     rho = np.empty_like(el)
     zone = np.ones(len(el), dtype=int)   # default: wall
@@ -159,7 +173,7 @@ def _barrel_profile(el, params):
     t = (el_wall - corner_top) / (corner_bot - corner_top)  # 0 at top corner, 1 at bot
     z_wall = h_top * (1 - t) + (-h_bot) * t   # linear in el → z
 
-    r_wall = _interp_profile(z_wall, span_m, r_crozehead_m, r_bilge_m, rng)
+    r_wall = _interp_profile(z_wall, span_m, r_crozehead_m, r_bilge_m, profile_perturb_m)
     sin_el = np.sin(el_wall)
     sin_el = np.where(sin_el > 1e-6, sin_el, 1e-6)
     rho[wall_mask] = np.sqrt(z_wall**2 + r_wall**2)
@@ -199,6 +213,11 @@ def generate_barrel_params(rng, overrides=None):
     n_staves = ov.get("n_staves", rng.integers(28, 36))
     stave_amp = ov.get("stave_amp", rng.uniform(0.0, 0.001))  # up to 1 mm
 
+    # Fixed per-barrel calibration-profile perturbation (drawn ONCE here, not
+    # per _interp_profile() call -- see the docstring in _interp_profile for why).
+    profile_perturb_m = ov.get("profile_perturb_m",
+                               rng.normal(0, _PROFILE_STD_MM / 1000.0 * 0.5))
+
     return {
         "span_m": span_m,
         "r_crozehead_m": r_crozehead_m,
@@ -211,6 +230,7 @@ def generate_barrel_params(rng, overrides=None):
         "ovality_phase": ovality_phase,
         "n_staves": n_staves,
         "stave_amp": stave_amp,
+        "profile_perturb_m": profile_perturb_m,
         "rng": rng,
     }
 

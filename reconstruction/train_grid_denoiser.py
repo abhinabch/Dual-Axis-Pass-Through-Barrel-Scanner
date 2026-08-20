@@ -26,8 +26,24 @@ from barrel_reconstruct import (
 from barrel_denoise_grid import GridUNet, prepare_grid_inputs, DEFAULT_CHECKPOINT
 
 
-def generate_train_sample(seed, n_points=100_000, head_dropout_rate=0.4):
-    """Generate one synthetic training pair (inputs, target_rho, target_outlier)."""
+def generate_train_sample(seed, n_points=100_000, head_dropout_rate=None,
+                          dropout_range=(0.2, 0.95)):
+    """Generate one synthetic training pair (inputs, target_rho, target_outlier).
+
+    head_dropout_rate=None (the training default) draws a fresh dropout rate
+    uniformly from dropout_range for EVERY sample, keyed off `seed` so it's
+    reproducible. This is a deliberate curriculum: a single fixed dropout rate
+    (the previous default of 0.4) under-represents the near-total emptiness
+    real single-pass head/pole rows actually have, which is exactly the
+    regime learned_clean_grid() was found to collapse in (see
+    notebooks/05_rules_vs_learned_volume_accuracy.ipynb). Pass a fixed float
+    to reproduce the old fixed-rate behavior (evaluate_model() below does
+    this deliberately, for an honest, non-circular held-out check).
+    """
+    if head_dropout_rate is None:
+        drop_rng = np.random.default_rng(seed * 7919 + 104729)  # decorrelated from generate_barrel's own seed
+        head_dropout_rate = float(drop_rng.uniform(*dropout_range))
+
     b = generate_barrel(seed=seed, n_points=n_points, add_bung=True, add_floaters=True,
                         head_dropout_rate=head_dropout_rate)
     P, N = b["P_noisy"], b["N_noisy"]
@@ -65,7 +81,8 @@ def generate_train_sample(seed, n_points=100_000, head_dropout_rate=0.4):
     # Ground truth offset channel relative to 0.31 base, scale 0.05
     target_rho_offset = (gt_grid - 0.31) / 0.05
 
-    return inp_tensor.squeeze(0), target_rho_offset, target_outlier.astype(np.float32), curv_grid, el_ctr, corners
+    return (inp_tensor.squeeze(0), target_rho_offset, target_outlier.astype(np.float32),
+            curv_grid, el_ctr, corners, cnt, head_dropout_rate)
 
 
 def train_epoch(model, optimizer, criterion_bce, batch_size=2, samples_per_epoch=10, device="cpu", epoch=1):
@@ -74,11 +91,18 @@ def train_epoch(model, optimizer, criterion_bce, batch_size=2, samples_per_epoch
     total_rho_loss = 0.0
     total_bce_loss = 0.0
 
-    inps, targets_rho, targets_out, curvs = [], [], [], []
+    inps, targets_rho, targets_out, curvs, sparsities = [], [], [], [], []
 
     for idx in range(samples_per_epoch):
         seed = epoch * 1000 + idx
-        inp, target_rho, target_out, curv, el_ctr, corners = generate_train_sample(seed=seed)
+        inp, target_rho, target_out, curv, el_ctr, corners, cnt, dropout_used = generate_train_sample(seed=seed)
+
+        # Per-cell sparsity weight: emptier cells (few/no raw points) get more loss
+        # weight, wherever they happen to fall -- not just a fixed top/bottom-15%
+        # row band. This directly targets the near-empty-cell collapse behavior
+        # regardless of exactly how far into the head/pole region it occurs.
+        sparsity = 1.0 / (1.0 + np.log1p(np.clip(cnt, 0, 50)))  # ~1.0 when empty, ~0.15 when well-sampled
+        sparsities.append(torch.from_numpy(sparsity.astype(np.float32)).unsqueeze(0))
 
         inps.append(inp)
         targets_rho.append(torch.from_numpy(target_rho.astype(np.float32)).unsqueeze(0))
@@ -90,18 +114,16 @@ def train_epoch(model, optimizer, criterion_bce, batch_size=2, samples_per_epoch
             b_trho = torch.stack(targets_rho).to(device)   # (B, 1, H, W)
             b_tout = torch.stack(targets_out).to(device)   # (B, 1, H, W)
             b_curv = torch.stack(curvs).to(device)         # (B, 1, H, W)
+            b_sparse = torch.stack(sparsities).to(device)  # (B, 1, H, W)
 
             optimizer.zero_grad()
             pred_rho_offset, pred_outlier_logits = model(b_inp)
 
-            # Curvature-weighted L1 reconstruction loss (emphasize creases + heads)
-            weight = 1.0 + 3.0 * b_curv
-            # Extra weight on head regions (top/bottom 15% rows)
-            H = b_inp.shape[2]
-            head_mask = torch.zeros_like(b_curv)
-            head_mask[:, :, :int(H * 0.15), :] = 2.0
-            head_mask[:, :, -int(H * 0.15):, :] = 2.0
-            weight = weight + head_mask
+            # Curvature-weighted L1 reconstruction loss (emphasize creases), plus
+            # sparsity-weighted emphasis (emphasize cells the model has to mostly
+            # extrapolate rather than measure directly -- this is where the
+            # wall-radius collapse failure mode lives).
+            weight = 1.0 + 3.0 * b_curv + 4.0 * b_sparse
 
             rho_loss = torch.mean(weight * torch.abs(pred_rho_offset - b_trho))
             bce_loss = criterion_bce(pred_outlier_logits, b_tout)
@@ -114,22 +136,35 @@ def train_epoch(model, optimizer, criterion_bce, batch_size=2, samples_per_epoch
             total_rho_loss += rho_loss.item() * len(inps)
             total_bce_loss += bce_loss.item() * len(inps)
 
-            inps, targets_rho, targets_out, curvs = [], [], [], []
+            inps, targets_rho, targets_out, curvs, sparsities = [], [], [], [], []
 
     return (total_loss / samples_per_epoch,
             total_rho_loss / samples_per_epoch,
             total_bce_loss / samples_per_epoch)
 
 
-def evaluate_model(model, n_eval=5, device="cpu"):
-    """Evaluate current model on held-out synthetic barrels."""
+def evaluate_model(model, n_eval=5, device="cpu", eval_dropout_rate=0.3):
+    """Evaluate current model on held-out synthetic barrels.
+
+    Uses a FIXED, realistic dropout rate (default 0.3, matching
+    barrel_synth.generate_barrel()'s own production default) rather than the
+    random training-time curriculum, so this is an honest held-out check and
+    not circular with what train_epoch() is being scored on. Also reports the
+    head/pole-row error separately from the wall-row error, since that split
+    is exactly where learned mode's collapse was diagnosed (see
+    notebooks/05_rules_vs_learned_volume_accuracy.ipynb) -- an overall RMS
+    can look fine while the head-row error stays bad.
+    """
     model.eval()
     gt_errors_mm = []
+    head_errors_mm = []
+    wall_errors_mm = []
 
     with torch.no_grad():
         for idx in range(n_eval):
             seed = 9999 + idx
-            inp, target_rho, target_out, curv, el_ctr, corners = generate_train_sample(seed=seed)
+            (inp, target_rho, target_out, curv, el_ctr, corners,
+             cnt, dropout_used) = generate_train_sample(seed=seed, head_dropout_rate=eval_dropout_rate)
             inp_t = inp.unsqueeze(0).to(device)
 
             pred_offset, _ = model(inp_t)
@@ -142,15 +177,30 @@ def evaluate_model(model, n_eval=5, device="cpu"):
             err_mm = np.sqrt(((pred_grid - gt_grid) ** 2).mean()) * 1000.0
             gt_errors_mm.append(err_mm)
 
-    return float(np.mean(gt_errors_mm))
+            head_rows = (np.asarray(el_ctr) < corners[0]) | (np.asarray(el_ctr) > corners[1])
+            if head_rows.any():
+                head_errors_mm.append(np.sqrt(((pred_grid[head_rows] - gt_grid[head_rows]) ** 2).mean()) * 1000.0)
+            if (~head_rows).any():
+                wall_errors_mm.append(np.sqrt(((pred_grid[~head_rows] - gt_grid[~head_rows]) ** 2).mean()) * 1000.0)
+
+    return {
+        "overall_mm": float(np.mean(gt_errors_mm)),
+        "head_mm": float(np.mean(head_errors_mm)) if head_errors_mm else float("nan"),
+        "wall_mm": float(np.mean(wall_errors_mm)) if wall_errors_mm else float("nan"),
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train GridUNet denoiser")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--samples-per-epoch", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--output", type=str, default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--select-on", choices=["overall", "head"], default="head",
+                        help="Which held-out metric to select the best checkpoint on. "
+                             "'head' (default) targets the diagnosed collapse failure "
+                             "mode directly instead of letting a good wall score hide it.")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -162,29 +212,31 @@ def main():
 
     best_eval_err = float("inf")
     print("\nStarting training for %d epochs..." % args.epochs)
-    print("Epoch | Loss   | Rho L1 | BCE    | Val GT RMS (mm) | Time")
-    print("-" * 55)
+    print("Epoch | Loss   | Rho L1 | BCE    | Val Overall (mm) | Val Head (mm) | Val Wall (mm) | Time")
+    print("-" * 95)
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         loss, rho_loss, bce_loss = train_epoch(
             model, optimizer, criterion_bce, batch_size=args.batch_size,
-            samples_per_epoch=20, device=device, epoch=epoch
+            samples_per_epoch=args.samples_per_epoch, device=device, epoch=epoch
         )
         t_elapsed = time.time() - t0
 
-        val_err_mm = evaluate_model(model, n_eval=3, device=device)
+        val = evaluate_model(model, n_eval=3, device=device)
+        select_metric = val["head_mm"] if args.select_on == "head" else val["overall_mm"]
 
         marker = ""
-        if val_err_mm < best_eval_err:
-            best_eval_err = val_err_mm
+        if select_metric < best_eval_err:
+            best_eval_err = select_metric
             torch.save(model.state_dict(), args.output)
             marker = " [saved]"
 
-        print("%5d | %.4f | %.4f | %.4f | %15.3f | %.1fs%s" %
-              (epoch, loss, rho_loss, bce_loss, val_err_mm, t_elapsed, marker))
+        print("%5d | %.4f | %.4f | %.4f | %17.3f | %13.3f | %13.3f | %.1fs%s" %
+              (epoch, loss, rho_loss, bce_loss, val["overall_mm"], val["head_mm"], val["wall_mm"],
+               t_elapsed, marker))
 
-    print("\nTraining complete! Best validation GT RMS: %.3f mm" % best_eval_err)
+    print("\nTraining complete! Best validation %s RMS: %.3f mm" % (args.select_on, best_eval_err))
     print("Checkpoint saved to: %s" % args.output)
 
 
