@@ -221,12 +221,18 @@ class SafetyWatchdog:
     Background thread that polls motor positions and alarms to detect stalls or faults.
     If a fault is detected, it calls the provided callback to trigger the Error screen.
     """
-    def __init__(self, client: ModbusSerialClient, callback: Callable[[Exception], None], poll_interval: float = 0.5):
+    def __init__(self, client: ModbusSerialClient, callback: Callable[[Exception], None], poll_interval: float = 1.5, lock=None):
         self.client = client
         self.callback = callback
         self.poll_interval = poll_interval
         self._running = False
         self._stop_event = None
+        # Serializes access to `client` against other threads/callers sharing the
+        # same Modbus RTU connection (e.g. the scan sequence's ModbusLink). Falls
+        # back to a private lock if the caller doesn't share one -- still correct,
+        # just doesn't protect against other users of the same client.
+        import threading
+        self.lock = lock if lock is not None else threading.Lock()
 
     def start(self):
         import threading
@@ -243,25 +249,51 @@ class SafetyWatchdog:
         log.info("SafetyWatchdog stopped.")
 
     def _run(self):
+        consecutive_failures = 0
         while self._running:
             try:
-                # Check Pan Axis
-                pan_status = read_motor_status(self.client, UNIT_ID_PAN)
-                if pan_status["faulty"]:
-                    log.error("SafetyWatchdog: Pan axis fault detected!")
-                    self.callback(PipelineError("Pan axis motor fault detected by safety watchdog."))
-                    break
+                with self.lock:
+                    # Check Pan Axis
+                    pan_status = read_motor_status(self.client, UNIT_ID_PAN)
+                    if pan_status["faulty"]:
+                        log.error("SafetyWatchdog: Pan axis fault detected!")
+                        self.callback(PipelineError("Pan axis motor fault detected by safety watchdog."))
+                        break
 
-                # Check Tilt Axis
-                tilt_status = read_motor_status(self.client, UNIT_ID_TILT)
+                    # Small inter-frame gap before addressing the other slave. Firing
+                    # requests at two different slave IDs back-to-back with zero gap
+                    # has been observed to eventually wedge one drive's RS485 receiver
+                    # (it stops answering entirely, needs a power cycle to recover) --
+                    # this gives its transceiver time to release the bus between
+                    # transactions instead of relying purely on request/response timing.
+                    time.sleep(0.05)
+
+                    # Check Tilt Axis
+                    tilt_status = read_motor_status(self.client, UNIT_ID_TILT)
                 if tilt_status["faulty"]:
                     log.error("SafetyWatchdog: Tilt axis fault detected!")
                     self.callback(PipelineError("Tilt axis motor fault detected by safety watchdog."))
                     break
-                
+
+                consecutive_failures = 0
             except Exception as e:
                 log.warning("SafetyWatchdog poll error: %s", e)
-            
+                consecutive_failures += 1
+                # Repeated back-to-back failures usually mean the client-side serial
+                # connection has gotten stuck (stale/misaligned bytes sitting in the
+                # receive buffer after a timeout). Reopening it is cheap and clears
+                # that case; it will NOT recover a drive that has actually hung and
+                # needs a physical power cycle, but it's harmless to try either way.
+                if consecutive_failures >= 3:
+                    log.warning("SafetyWatchdog: %d consecutive poll failures, reconnecting client...", consecutive_failures)
+                    try:
+                        with self.lock:
+                            self.client.close()
+                            self.client.connect()
+                    except Exception as reconnect_err:
+                        log.warning("SafetyWatchdog: reconnect attempt failed: %s", reconnect_err)
+                    consecutive_failures = 0
+
             time.sleep(self.poll_interval)
 
 # ---------------------------------------------------------------------------
