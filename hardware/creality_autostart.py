@@ -80,24 +80,45 @@ class CrealityAutomator:
         )
         os.makedirs(self.debug_dir, exist_ok=True)
 
+    @staticmethod
+    def _find_window_title() -> Optional[str]:
+        """Find the real CrealityScan window title among all open windows.
+
+        A plain substring match on "CrealityScan" also matches unrelated windows
+        whose title happens to contain it -- e.g. an editor with a file named
+        "CrealityScan_notes.md" open produces a title like "CrealityScan_notes.md
+        - ... - Visual Studio Code". Since getAllTitles() order isn't guaranteed,
+        such a window can sort before the real app and get focused/maximized
+        instead of it. The real app's title is exactly "CrealityScan", so prefer
+        an exact (case-insensitive) match and only fall back to substring
+        matching if no exact match exists.
+        """
+        titles = gw.getAllTitles()
+        for t in titles:
+            if t.strip().lower() == WINDOW_TITLE_SUBSTRING.lower():
+                return t
+        for t in titles:
+            if WINDOW_TITLE_SUBSTRING.lower() in t.lower():
+                return t
+        return None
+
     def is_window_available(self) -> bool:
         """Check if Creality Scan window is currently open."""
         try:
-            matches = [w for w in gw.getAllTitles() if WINDOW_TITLE_SUBSTRING.lower() in w.lower()]
-            return len(matches) > 0
+            return self._find_window_title() is not None
         except Exception:
             return False
 
     def focus_window(self) -> None:
         """Find the Creality Scan window and bring it to the foreground."""
-        matches = [w for w in gw.getAllTitles() if WINDOW_TITLE_SUBSTRING.lower() in w.lower()]
-        if not matches:
+        match = self._find_window_title()
+        if match is None:
             raise AutomationError(
                 f"No window found with title containing '{WINDOW_TITLE_SUBSTRING}'. "
                 "Is Creality Scan running?"
             )
 
-        win = gw.getWindowsWithTitle(matches[0])[0]
+        win = gw.getWindowsWithTitle(match)[0]
         if win.isMinimized:
             win.restore()
         win.activate()
@@ -160,6 +181,26 @@ class CrealityAutomator:
         """
         self.focus_window()
         candidate_dirs = self._get_candidate_dirs()
+
+        # Fast path: the window is maximized by focus_window(), so pyautogui.size()
+        # is the resolution its UI is actually rendered at. A folder is literally
+        # named after the resolution it was captured for, so if one matches, trust
+        # it outright instead of running it through the same exhaustive probe as an
+        # unknown folder (4 templates x 4 confidences x 2 grayscale modes = up to 32
+        # full-screen screenshot+match calls). That probe is also being run before
+        # CrealityScan has necessarily finished rendering after launch, so on a
+        # correctly-named-but-not-yet-drawn window it burns through every combo on
+        # every folder for nothing and falls back to the empty base dir -- costing
+        # tens of seconds before the real button-wait loop ever starts polling.
+        screen_w, screen_h = pyautogui.size()
+        preferred_dir = os.path.join(self.template_base_dir, f"{screen_w}x{screen_h}")
+        if preferred_dir in candidate_dirs:
+            self.active_resolution_folder = preferred_dir
+            log.info(
+                "Using template set matching screen resolution %dx%d: %s",
+                screen_w, screen_h, preferred_dir,
+            )
+            return preferred_dir
 
         # Key elements to test for resolution matching
         test_templates = ["preview_button.png", "ready_text.png", "start_button.png", "stop_button.png"]
@@ -356,8 +397,13 @@ class CrealityAutomator:
         if not self.active_resolution_folder:
             self.detect_resolution()
 
-        # Step 1: Click Preview / Setup
-        self.wait_for_and_click("preview_button.png", "Preview")
+        # Step 1: Click Preview / Setup. Generous timeout: this is the first click
+        # after launch/focus, and detect_resolution() no longer spends ~30-60s
+        # probing template folders on the way here -- that probe used to double as
+        # an incidental buffer while CrealityScan finished its own startup
+        # rendering. Give that real startup lag an explicit allowance instead of
+        # relying on the removed probe to cover it.
+        self.wait_for_and_click("preview_button.png", "Preview", timeout=60.0)
 
         # Step 2: Wait for ready text banner
         self.wait_for_element("ready_text.png", "Ready Banner")

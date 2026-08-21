@@ -422,6 +422,15 @@ class AppGUI(ctk.CTk):
         self.client: Optional[ModbusSerialClient] = None
         self.link: Optional[ModbusLink] = None
         self.watchdog: Optional[SafetyWatchdog] = None
+        # A Modbus RTU serial link is a single half-duplex channel -- only one
+        # transaction can be in flight at a time. self.client is read/written from
+        # poll_connections() (main-thread timer), jog_axis() (main-thread button),
+        # handle_emergency_stop(), the SafetyWatchdog background thread, and the
+        # scan-sequence pipeline_worker thread (via self.link, which wraps the same
+        # client). Without a shared lock, concurrent transactions from these corrupt
+        # each other's request/response frames on the wire (garbled slave IDs,
+        # timeouts, eventual forced connection close).
+        self.modbus_lock = threading.Lock()
         self.automator = CrealityAutomator()
         self.worker_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -790,7 +799,8 @@ class AppGUI(ctk.CTk):
         """Immediate E-Stop path."""
         log.critical("E-STOP TRIGGERED FROM GUI")
         if self.client:
-            emergency_stop(self.client)
+            with self.modbus_lock:
+                emergency_stop(self.client)
         self.stop_event.set()
         self.show_frame(AppState.ERROR)
         
@@ -849,7 +859,7 @@ class AppGUI(ctk.CTk):
         self.update_timer_loop()
 
         # Start Safety Watchdog
-        self.watchdog = SafetyWatchdog(self.client, self._watchdog_fault_callback)
+        self.watchdog = SafetyWatchdog(self.client, self._watchdog_fault_callback, lock=self.modbus_lock)
         self.watchdog.start()
 
         # Launch Worker
@@ -881,7 +891,6 @@ class AppGUI(ctk.CTk):
             # ESS17Controller/IDM57Controller call link.read_reg()/write_reg()/write_regs(),
             # which the raw ModbusSerialClient does not implement.
             run_scan_sequence(self.link, config=self.scan_config, progress_callback=progress_cb)
-
             # Stop scan in scanner UI
             try:
                 self.automator.stop_scan()
@@ -1045,9 +1054,10 @@ class AppGUI(ctk.CTk):
             return
         try:
             pulses_per_rev = PULSES_PER_REV_PAN if unit_id == UNIT_ID_PAN else PULSES_PER_REV_TILT
-            curr = read_encoder_position(self.client, unit_id)
-            target = curr + (revs * pulses_per_rev)
-            send_absolute_move(self.client, unit_id, target)
+            with self.modbus_lock:
+                curr = read_encoder_position(self.client, unit_id)
+                target = curr + (revs * pulses_per_rev)
+                send_absolute_move(self.client, unit_id, target)
         except Exception as e:
             log.error("Jog failed: %s", e)
 
@@ -1066,7 +1076,7 @@ class AppGUI(ctk.CTk):
 
         self.client = ModbusSerialClient(port=port, baudrate=baud, timeout=TIMEOUT)
         connected = self.client.connect()
-        self.link = ModbusLink(port=port, baudrate=baud, client=self.client)
+        self.link = ModbusLink(port=port, baudrate=baud, client=self.client, lock=self.modbus_lock)
         return connected
 
     def apply_settings(self):
@@ -1114,7 +1124,8 @@ class AppGUI(ctk.CTk):
 
             if self.client.connected:
                 # Try to read a status register to verify actual communication
-                status = read_motor_status(self.client, UNIT_ID_PAN)
+                with self.modbus_lock:
+                    status = read_motor_status(self.client, UNIT_ID_PAN)
                 if status is not None:
                     turret_ok = True
         except Exception as e:
