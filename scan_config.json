@@ -18,5 +18,16 @@
     "rot_deg": 1440.0,
     "rot_revs": 4.0,
     "pause_seconds": 1.0
+  },
+  "led_settings": {
+    "enabled": false,
+    "port": "COM4",
+    "baudrate": 9600,
+    "slave_id": 1,
+    "channel": 1,
+    "freq_hz": 1000.0,
+    "overall_brightness_pct": 40.0,
+    "tilt_pass_brightness_pct": 70.0,
+    "rotation_brightness_pct": 100.0
   }
 }

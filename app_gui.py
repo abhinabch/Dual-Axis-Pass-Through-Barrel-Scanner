@@ -1302,6 +1302,61 @@ class AppGUI(ctk.CTk):
         self.populate_gui_config_fields()
 
         # -------------------------------------------------------------------
+        # Section 1b: LED Brightness Configuration (Waveshare PWM Output 4CH)
+        # -------------------------------------------------------------------
+        led_box = ctk.CTkFrame(scroll_container)
+        led_box.pack(fill="x", padx=20, pady=10)
+
+        ctk.CTkLabel(led_box, text="LED Brightness Configuration (Waveshare PWM 4CH)", font=("Roboto", 18, "bold")).pack(pady=(15, 5))
+        ctk.CTkLabel(led_box, text="LEDs turn on at the start of a scan and switch brightness by movement phase", font=("Roboto", 12), text_color="gray").pack(pady=(0, 15))
+
+        self.led_enabled_var = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(led_box, text="Enable LED Control", variable=self.led_enabled_var).pack(anchor="w", padx=30, pady=(0, 10))
+
+        led_grid = ctk.CTkFrame(led_box, fg_color="transparent")
+        led_grid.pack(fill="x", padx=20, pady=5)
+        led_grid.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        ctk.CTkLabel(led_grid, text="LED Serial Port:").grid(row=0, column=0, padx=10, pady=5, sticky="e")
+        self.led_port_entry = ctk.CTkEntry(led_grid, width=140)
+        self.led_port_entry.grid(row=0, column=1, padx=10, pady=5, sticky="w")
+
+        ctk.CTkLabel(led_grid, text="Baud Rate:").grid(row=0, column=2, padx=10, pady=5, sticky="e")
+        self.led_baud_entry = ctk.CTkEntry(led_grid, width=140)
+        self.led_baud_entry.grid(row=0, column=3, padx=10, pady=5, sticky="w")
+
+        ctk.CTkLabel(led_grid, text="Slave ID:").grid(row=1, column=0, padx=10, pady=5, sticky="e")
+        self.led_slave_entry = ctk.CTkEntry(led_grid, width=140)
+        self.led_slave_entry.grid(row=1, column=1, padx=10, pady=5, sticky="w")
+
+        ctk.CTkLabel(led_grid, text="Channel (1-4):").grid(row=1, column=2, padx=10, pady=5, sticky="e")
+        self.led_channel_entry = ctk.CTkEntry(led_grid, width=140)
+        self.led_channel_entry.grid(row=1, column=3, padx=10, pady=5, sticky="w")
+
+        ctk.CTkLabel(led_grid, text="PWM Frequency (Hz):").grid(row=2, column=0, padx=10, pady=5, sticky="e")
+        self.led_freq_entry = ctk.CTkEntry(led_grid, width=140)
+        self.led_freq_entry.grid(row=2, column=1, padx=10, pady=5, sticky="w")
+
+        # Brightness sliders: entire movement / each tilt pass / each rotation
+        sliders_frame = ctk.CTkFrame(led_box, fg_color="transparent")
+        sliders_frame.pack(fill="x", padx=20, pady=(10, 15))
+
+        self.led_overall_slider, self.led_overall_lbl = self._make_brightness_slider(
+            sliders_frame, "Entire Movement Brightness:"
+        )
+        self.led_tilt_slider, self.led_tilt_lbl = self._make_brightness_slider(
+            sliders_frame, "Each Tilt Pass Brightness:"
+        )
+        self.led_rot_slider, self.led_rot_lbl = self._make_brightness_slider(
+            sliders_frame, "Each Rotation Brightness:"
+        )
+
+        # LED widgets didn't exist yet during the populate_gui_config_fields() call
+        # above (it's run once for the motor/sweep fields before this section is
+        # built) -- re-run it now so the LED fields pick up self.scan_config too.
+        self.populate_gui_config_fields()
+
+        # -------------------------------------------------------------------
         # Section 2: Manual Axis Control (Jogging)
         # -------------------------------------------------------------------
         controls_frame = ctk.CTkFrame(scroll_container)
@@ -1334,6 +1389,31 @@ class AppGUI(ctk.CTk):
         ctk.CTkButton(recon_row, text="Run Reconstruction", command=self.manual_reconstruct).pack(side="left", padx=10)
 
         return frame
+
+    def _make_brightness_slider(self, parent, label_text: str):
+        """Builds a labeled 0-100% brightness slider row and returns (slider, value_label)."""
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=6)
+
+        ctk.CTkLabel(row, text=label_text, width=200, anchor="w").pack(side="left", padx=(0, 10))
+
+        value_lbl = ctk.CTkLabel(row, text="0%", width=50)
+
+        def _on_slide(v):
+            value_lbl.configure(text=f"{float(v):.0f}%")
+
+        slider = ctk.CTkSlider(row, from_=0, to=100, number_of_steps=100, command=_on_slide)
+        slider.set(0)
+        slider.pack(side="left", fill="x", expand=True, padx=10)
+        value_lbl.pack(side="left", padx=(0, 10))
+
+        return slider, value_lbl
+
+    def _set_brightness_slider(self, slider, value_lbl, pct: float):
+        """Programmatically sets a brightness slider's position and its value label."""
+        pct = max(0.0, min(100.0, float(pct)))
+        slider.set(pct)
+        value_lbl.configure(text=f"{pct:.0f}%")
 
     def _on_protractor_change(self, pulses: List[int]):
         """Sync protractor changes with the secondary raw encoder text entry."""
@@ -1426,6 +1506,40 @@ class AppGUI(ctk.CTk):
             self.cleanup_mode_var.set(cleanup_mode)
             self._update_cleanup_mode_note()
 
+        led_cfg = self.scan_config.get("led_settings", {})
+
+        if hasattr(self, "led_enabled_var"):
+            self.led_enabled_var.set(bool(led_cfg.get("enabled", False)))
+
+        if hasattr(self, "led_port_entry"):
+            self.led_port_entry.delete(0, "end")
+            self.led_port_entry.insert(0, str(led_cfg.get("port", "COM4")))
+
+        if hasattr(self, "led_baud_entry"):
+            self.led_baud_entry.delete(0, "end")
+            self.led_baud_entry.insert(0, str(led_cfg.get("baudrate", 9600)))
+
+        if hasattr(self, "led_slave_entry"):
+            self.led_slave_entry.delete(0, "end")
+            self.led_slave_entry.insert(0, str(led_cfg.get("slave_id", 1)))
+
+        if hasattr(self, "led_channel_entry"):
+            self.led_channel_entry.delete(0, "end")
+            self.led_channel_entry.insert(0, str(led_cfg.get("channel", 1)))
+
+        if hasattr(self, "led_freq_entry"):
+            self.led_freq_entry.delete(0, "end")
+            self.led_freq_entry.insert(0, str(led_cfg.get("freq_hz", 1000.0)))
+
+        if hasattr(self, "led_overall_slider"):
+            self._set_brightness_slider(self.led_overall_slider, self.led_overall_lbl, led_cfg.get("overall_brightness_pct", 40.0))
+
+        if hasattr(self, "led_tilt_slider"):
+            self._set_brightness_slider(self.led_tilt_slider, self.led_tilt_lbl, led_cfg.get("tilt_pass_brightness_pct", 70.0))
+
+        if hasattr(self, "led_rot_slider"):
+            self._set_brightness_slider(self.led_rot_slider, self.led_rot_lbl, led_cfg.get("rotation_brightness_pct", 100.0))
+
     def save_gui_config(self):
         """Save input values from GUI into self.scan_config and write to scan_config.json."""
         try:
@@ -1456,9 +1570,30 @@ class AppGUI(ctk.CTk):
                 selected_mode = self.cleanup_mode_var.get().strip()
                 r_cfg["cleanup_mode"] = selected_mode if selected_mode in VALID_CLEANUP_MODES else "rules"
 
+            led_cfg = self.scan_config.get("led_settings", {})
+            if hasattr(self, "led_enabled_var"):
+                led_cfg["enabled"] = bool(self.led_enabled_var.get())
+            if hasattr(self, "led_port_entry"):
+                led_cfg["port"] = self.led_port_entry.get().strip()
+            if hasattr(self, "led_baud_entry"):
+                led_cfg["baudrate"] = int(self.led_baud_entry.get().strip())
+            if hasattr(self, "led_slave_entry"):
+                led_cfg["slave_id"] = int(self.led_slave_entry.get().strip())
+            if hasattr(self, "led_channel_entry"):
+                led_cfg["channel"] = max(1, min(4, int(self.led_channel_entry.get().strip())))
+            if hasattr(self, "led_freq_entry"):
+                led_cfg["freq_hz"] = float(self.led_freq_entry.get().strip())
+            if hasattr(self, "led_overall_slider"):
+                led_cfg["overall_brightness_pct"] = float(self.led_overall_slider.get())
+            if hasattr(self, "led_tilt_slider"):
+                led_cfg["tilt_pass_brightness_pct"] = float(self.led_tilt_slider.get())
+            if hasattr(self, "led_rot_slider"):
+                led_cfg["rotation_brightness_pct"] = float(self.led_rot_slider.get())
+
             self.scan_config["motor_settings"] = m_cfg
             self.scan_config["sweep_settings"] = s_cfg
             self.scan_config["reconstruction_settings"] = r_cfg
+            self.scan_config["led_settings"] = led_cfg
 
             if save_config(self.scan_config):
                 self.cfg_status_lbl.configure(text="✔ Configuration saved to scan_config.json", text_color="green")

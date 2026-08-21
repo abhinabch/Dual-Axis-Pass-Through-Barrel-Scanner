@@ -317,6 +317,63 @@ class IDM57Controller:
 
 
 from config_manager import load_config, DEFAULT_CONFIG_PATH
+from hardware.waveshare_pwm_led_demo import WavesharePwmController
+
+
+# ---------------------------------------------------------------------------
+# LED Brightness Control (Waveshare Modbus RTU PWM Output 4CH)
+# ---------------------------------------------------------------------------
+def _init_led_controller(led_cfg):
+    """
+    Connects to the Waveshare PWM LED controller and primes the configured
+    channel with its frequency and 'entire movement' baseline brightness.
+    Returns None (instead of raising) on any failure so a missing/misconfigured
+    LED rig never blocks the motor scan sequence.
+    """
+    if not led_cfg or not led_cfg.get("enabled", False):
+        return None
+
+    try:
+        ctrl = WavesharePwmController(
+            port=led_cfg.get("port", "COM4"),
+            baudrate=led_cfg.get("baudrate", 9600),
+            slave_id=led_cfg.get("slave_id", 1),
+        )
+        ctrl.connect()
+        ctrl.set_channel_config(
+            channel=led_cfg.get("channel", 1),
+            freq_hz=led_cfg.get("freq_hz", 1000.0),
+            duty_pct=led_cfg.get("overall_brightness_pct", 40.0),
+        )
+        return ctrl
+    except Exception as e:
+        logger.warning(f"LED controller unavailable, continuing scan without LEDs: {e}")
+        return None
+
+
+def _set_led_brightness(led_ctrl, led_cfg, duty_pct):
+    """Best-effort duty cycle update; LED faults are logged but never abort the scan."""
+    if led_ctrl is None:
+        return
+    try:
+        led_ctrl.set_channel_duty(led_cfg.get("channel", 1), duty_pct)
+    except Exception as e:
+        logger.warning(f"Failed to update LED brightness to {duty_pct}%: {e}")
+
+
+def _close_led_controller(led_ctrl, led_cfg):
+    """Safety cleanup: duty cycle to 0% (LED off) before closing the connection."""
+    if led_ctrl is None:
+        return
+    try:
+        led_ctrl.set_channel_duty(led_cfg.get("channel", 1), 0.0)
+    except Exception as e:
+        logger.warning(f"Failed to reset LED duty cycle during cleanup: {e}")
+    finally:
+        try:
+            led_ctrl.close()
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Main Scan Sequence Routine
@@ -366,6 +423,14 @@ def run_scan_sequence(
     if tilt_targets is None:
         tilt_targets = sweep_cfg.get("tilt_targets_pulses", [-8000, -4000, 0, 2000, 5000])
 
+    led_cfg = config.get("led_settings", {})
+    led_ctrl = _init_led_controller(led_cfg)
+    if led_ctrl is not None:
+        _notify(
+            f"LEDs on (Slave {led_cfg.get('slave_id', 1)}, Ch{led_cfg.get('channel', 1)}) "
+            f"@ {led_cfg.get('overall_brightness_pct', 40.0):.0f}% for the full movement."
+        )
+
     tilt_axis = ESS17Controller(link, slave_id=tilt_slave, initial_position=0)
     rot_axis = IDM57Controller(link, slave_id=rot_slave, initial_position=0)
 
@@ -390,6 +455,7 @@ def run_scan_sequence(
     try:
         total_steps = len(tilt_targets)
         for idx, target in enumerate(tilt_targets, 1):
+            _set_led_brightness(led_ctrl, led_cfg, led_cfg.get("tilt_pass_brightness_pct", 70.0))
             _notify(f"Step {idx}/{total_steps}: Moving Tilt to {target} pulses ({target / ESS17Controller.PULSES_PER_REV:+.2f} revs)...")
             if not tilt_axis.move_absolute(target, velocity_rpm=tilt_speed):
                 logger.error(f"Tilt move to {target} failed. Aborting sequence.")
@@ -399,6 +465,7 @@ def run_scan_sequence(
             time.sleep(pause_s)
 
             # Rotation motor positive sweep (+rot_revs revolutions)
+            _set_led_brightness(led_ctrl, led_cfg, led_cfg.get("rotation_brightness_pct", 100.0))
             _notify(f"Step {idx}/{total_steps}: Rotation sweep +{rot_deg:.0f}° (+{rot_pulses} pulses)...")
             if not rot_axis.move_relative(rot_pulses, velocity_rpm=rot_speed):
                 logger.error(f"Rotation +{rot_deg:.0f} deg sweep failed. Aborting sequence.")
@@ -415,6 +482,9 @@ def run_scan_sequence(
             # Guarantee alignment back to initial rotation position for each pass
             rot_axis.move_absolute(initial_rot_pos, velocity_rpm=rot_speed)
 
+            # Back to the entire-movement baseline until the next tilt pass begins
+            _set_led_brightness(led_ctrl, led_cfg, led_cfg.get("overall_brightness_pct", 40.0))
+
     except Exception as e:
         logger.exception(f"Unexpected error during scan sequence execution: {e}")
     finally:
@@ -424,6 +494,10 @@ def run_scan_sequence(
         
         logger.info(f"Returning Rotation axis to initial position ({initial_rot_pos} pulses)...")
         rot_axis.move_absolute(initial_rot_pos, velocity_rpm=rot_speed)
+
+        if led_ctrl is not None:
+            _notify("Turning off LEDs...")
+            _close_led_controller(led_ctrl, led_cfg)
 
         _notify("Scan sequence completed.")
 

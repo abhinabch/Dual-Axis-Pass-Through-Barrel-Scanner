@@ -42,6 +42,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "reconstruction_settings": {
         "cleanup_mode": "rules"
+    },
+    "led_settings": {
+        "enabled": False,
+        "port": "COM4",
+        "baudrate": 9600,
+        "slave_id": 1,
+        "channel": 1,
+        "freq_hz": 1000.0,
+        "overall_brightness_pct": 40.0,
+        "tilt_pass_brightness_pct": 70.0,
+        "rotation_brightness_pct": 100.0
     }
 }
 
@@ -76,6 +87,11 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
             for k, v in data["reconstruction_settings"].items():
                 config["reconstruction_settings"][k] = v
 
+        # Merge led_settings
+        if "led_settings" in data and isinstance(data["led_settings"], dict):
+            for k, v in data["led_settings"].items():
+                config["led_settings"][k] = v
+
         # Validate cleanup_mode; fall back to the safe default if the config file
         # has an unrecognized value (e.g. hand-edited or from an older version).
         if config["reconstruction_settings"].get("cleanup_mode") not in VALID_CLEANUP_MODES:
@@ -84,6 +100,14 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
                 config["reconstruction_settings"].get("cleanup_mode"),
             )
             config["reconstruction_settings"]["cleanup_mode"] = "rules"
+
+        # Clamp LED brightness percentages to the valid 0-100% duty cycle range.
+        for pct_key in ("overall_brightness_pct", "tilt_pass_brightness_pct", "rotation_brightness_pct"):
+            try:
+                pct_val = float(config["led_settings"].get(pct_key, 0.0))
+            except (TypeError, ValueError):
+                pct_val = 0.0
+            config["led_settings"][pct_key] = max(0.0, min(100.0, pct_val))
 
         # Keep rot_deg and rot_revs synchronized
         rot_pulses_per_rev = config["motor_settings"].get("rot_pulses_per_rev", 10000)
