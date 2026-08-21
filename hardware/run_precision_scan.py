@@ -231,8 +231,10 @@ class SafetyWatchdog:
         # same Modbus RTU connection (e.g. the scan sequence's ModbusLink). Falls
         # back to a private lock if the caller doesn't share one -- still correct,
         # just doesn't protect against other users of the same client.
+        # RLock to match ModbusLink's lock (see scan_sequence.py) in case the same
+        # lock object is ever shared with reentrant callers.
         import threading
-        self.lock = lock if lock is not None else threading.Lock()
+        self.lock = lock if lock is not None else threading.RLock()
 
     def start(self):
         import threading
