@@ -1,4 +1,5 @@
 import time
+import threading
 import logging
 import argparse
 from pymodbus.client import ModbusSerialClient as ModbusClient
@@ -41,7 +42,7 @@ IDM57_RELATIVE_MOVE_WORD = (1 << 0) | (1 << 6) # 0x0041 (Relative Position Move)
 
 
 class ModbusLink:
-    def __init__(self, port='COM3', baudrate=115200, client=None):
+    def __init__(self, port='COM3', baudrate=115200, client=None, lock=None):
         """
         Thin register-access wrapper used by the scan sequence.
 
@@ -50,9 +51,18 @@ class ModbusLink:
         it is reused instead of opening a second connection on the same serial
         port -- opening two independent handles to the same COM port will fail or
         fight each other.
+
+        If `lock` is provided (shared with other callers of that same client, e.g.
+        the GUI's SafetyWatchdog and jog/poll code), every register transaction is
+        serialized against it. A Modbus RTU link is a single half-duplex channel --
+        concurrent transactions from different threads corrupt each other's
+        request/response frames on the wire. Falls back to a private lock if none
+        is given, which is still correct as long as this ModbusLink is the only
+        thing touching `client`.
         """
         self.port = port
         self.baudrate = baudrate
+        self.lock = lock if lock is not None else threading.Lock()
         if client is not None:
             self.client = client
         else:
@@ -82,43 +92,67 @@ class ModbusLink:
             logger.warning("Modbus connection was closed by driver. Re-connecting...")
             self.client.connect()
 
+    # Default retry count/backoff for register transactions. Under GUI load (Tk
+    # mainloop + SafetyWatchdog polling thread + scan thread all fighting over the
+    # GIL and this same serial link), a single request/response can transiently
+    # miss its timeout window even though the drive answered fine -- retrying a
+    # couple of times with a short backoff recovers from that without having to
+    # guess at static settle delays.
+    RETRY_ATTEMPTS = 2
+    RETRY_DELAY_S = 0.2
+
     def read_reg(self, slave_id, address):
-        self.ensure_connected()
-        time.sleep(0.01)
-        try:
-            result = self.client.read_holding_registers(address, count=1, device_id=slave_id)
-            if result is None or result.isError():
-                logger.error(f"Modbus Error reading register {hex(address)} from Slave {slave_id}: {result}")
-                return None
-            return result.registers[0]
-        except Exception as e:
-            logger.error(f"Failed to read register {hex(address)} from Slave {slave_id}: {e}")
+        with self.lock:
+            for attempt in range(1, self.RETRY_ATTEMPTS + 2):
+                self.ensure_connected()
+                time.sleep(0.01)
+                try:
+                    result = self.client.read_holding_registers(address, count=1, device_id=slave_id)
+                    if result is None or result.isError():
+                        logger.warning(f"Modbus read attempt {attempt}/{self.RETRY_ATTEMPTS + 1} failed for register {hex(address)} on Slave {slave_id}: {result}")
+                    else:
+                        return result.registers[0]
+                except Exception as e:
+                    logger.warning(f"Modbus read attempt {attempt}/{self.RETRY_ATTEMPTS + 1} raised for register {hex(address)} on Slave {slave_id}: {e}")
+                if attempt <= self.RETRY_ATTEMPTS:
+                    time.sleep(self.RETRY_DELAY_S)
+            logger.error(f"Modbus read failed after {self.RETRY_ATTEMPTS + 1} attempts: register {hex(address)} on Slave {slave_id}")
             return None
 
     def write_reg(self, slave_id, address, value):
-        self.ensure_connected()
-        time.sleep(0.01)
-        try:
-            result = self.client.write_register(address, value, device_id=slave_id)
-            if result is None or result.isError():
-                logger.error(f"Modbus Error writing register {hex(address)} to Slave {slave_id}: {result}")
-                return False
-            return True
-        except Exception as e:
-            logger.error(f"Failed to write register {hex(address)} to Slave {slave_id}: {e}")
+        with self.lock:
+            for attempt in range(1, self.RETRY_ATTEMPTS + 2):
+                self.ensure_connected()
+                time.sleep(0.01)
+                try:
+                    result = self.client.write_register(address, value, device_id=slave_id)
+                    if result is None or result.isError():
+                        logger.warning(f"Modbus write attempt {attempt}/{self.RETRY_ATTEMPTS + 1} failed for register {hex(address)} on Slave {slave_id}: {result}")
+                    else:
+                        return True
+                except Exception as e:
+                    logger.warning(f"Modbus write attempt {attempt}/{self.RETRY_ATTEMPTS + 1} raised for register {hex(address)} on Slave {slave_id}: {e}")
+                if attempt <= self.RETRY_ATTEMPTS:
+                    time.sleep(self.RETRY_DELAY_S)
+            logger.error(f"Modbus write failed after {self.RETRY_ATTEMPTS + 1} attempts: register {hex(address)} on Slave {slave_id}, value {value}")
             return False
 
     def write_regs(self, slave_id, address, values):
-        self.ensure_connected()
-        time.sleep(0.01)
-        try:
-            result = self.client.write_registers(address, values, device_id=slave_id)
-            if result is None or result.isError():
-                logger.error(f"Modbus Error writing registers from {hex(address)} to Slave {slave_id}: {result}")
-                return False
-            return True
-        except Exception as e:
-            logger.error(f"Failed to write registers from {hex(address)} to Slave {slave_id}: {e}")
+        with self.lock:
+            for attempt in range(1, self.RETRY_ATTEMPTS + 2):
+                self.ensure_connected()
+                time.sleep(0.01)
+                try:
+                    result = self.client.write_registers(address, values, device_id=slave_id)
+                    if result is None or result.isError():
+                        logger.warning(f"Modbus write attempt {attempt}/{self.RETRY_ATTEMPTS + 1} failed for registers from {hex(address)} on Slave {slave_id}: {result}")
+                    else:
+                        return True
+                except Exception as e:
+                    logger.warning(f"Modbus write attempt {attempt}/{self.RETRY_ATTEMPTS + 1} raised for registers from {hex(address)} on Slave {slave_id}: {e}")
+                if attempt <= self.RETRY_ATTEMPTS:
+                    time.sleep(self.RETRY_DELAY_S)
+            logger.error(f"Modbus write failed after {self.RETRY_ATTEMPTS + 1} attempts: registers from {hex(address)} on Slave {slave_id}, values {values}")
             return False
 
 
@@ -155,21 +189,28 @@ class ESS17Controller:
         }
 
     def wait_for_complete(self, timeout=30):
+        # Poll interval deliberately loose: this loop runs continuously for the
+        # entire duration of a move (many seconds), sharing one half-duplex RS485
+        # line with SafetyWatchdog's own polling. Polling at 50ms (~20 req/s) here
+        # sustains enough combined bus traffic to eventually wedge a drive's RS485
+        # receiver (observed needing a physical power cycle to recover) -- 250ms is
+        # still far tighter than needed to notice a multi-second move finishing.
+        POLL_INTERVAL = 0.25
         start_time = time.time()
         while time.time() - start_time < timeout:
             status = self.read_status()
             if status is None:
-                time.sleep(0.05)
+                time.sleep(POLL_INTERVAL)
                 continue
             if status['alarm']:
                 logger.error(f"ESS17 drive ALARM on Slave {self.slave_id}!")
                 return False
             if status['in_position'] and not status['running']:
-                time.sleep(0.05)
+                time.sleep(POLL_INTERVAL)
                 final_status = self.read_status()
                 if final_status and final_status['in_position'] and not final_status['running']:
                     return True
-            time.sleep(0.05)
+            time.sleep(POLL_INTERVAL)
         logger.warning(f"ESS17 motion timed out after {timeout}s on Slave {self.slave_id}.")
         return False
 
@@ -253,18 +294,22 @@ class IDM57Controller:
         }
 
     def wait_for_complete(self, timeout=30):
+        # See ESS17Controller.wait_for_complete for why this interval is loose
+        # rather than 50ms -- sustained dense polling on this same bus/slave has
+        # been observed to wedge the iDM57's RS485 receiver until power-cycled.
+        POLL_INTERVAL = 0.25
         start_time = time.time()
         while time.time() - start_time < timeout:
             status = self.read_status()
             if status is None:
-                time.sleep(0.05)
+                time.sleep(POLL_INTERVAL)
                 continue
             if status['faulty']:
                 logger.error(f"iDM57 drive FAULT detected on Slave {self.slave_id}!")
                 return False
             if status['path_completed'] and not status['running']:
                 return True
-            time.sleep(0.05)
+            time.sleep(POLL_INTERVAL)
         logger.warning(f"iDM57 motion timed out after {timeout}s on Slave {self.slave_id}.")
         return False
 
@@ -467,7 +512,13 @@ def run_scan_sequence(
             # Rotation motor positive sweep (+rot_revs revolutions)
             _set_led_brightness(led_ctrl, led_cfg, led_cfg.get("rotation_brightness_pct", 100.0))
             _notify(f"Step {idx}/{total_steps}: Rotation sweep +{rot_deg:.0f}° (+{rot_pulses} pulses)...")
+            time.sleep(pause_s)
             if not rot_axis.move_relative(rot_pulses, velocity_rpm=rot_speed):
+                time.sleep(pause_s)
+                #this sleep is necessary for the rot motor to be able to recieve and
+                # send the next command. Without this sleep, the next command wont
+                # be sent and the program will hang. This is a known issue with the
+                #iDM57 motor and is not a problem with the code.
                 logger.error(f"Rotation +{rot_deg:.0f} deg sweep failed. Aborting sequence.")
                 break
 
@@ -525,7 +576,7 @@ def main():
     rot_slave = args.rot_slave or motor_cfg.get("rot_slave_id", 1)
     tilt_speed = args.tilt_speed or sweep_cfg.get("tilt_speed_rpm", 60)
     rot_speed = args.rot_speed or sweep_cfg.get("rot_speed_rpm", 60)
-    pause_s = args.pause if args.pause is not None else sweep_cfg.get("pause_seconds", 1.0)
+    pause_s = args.pause if args.pause is not None else sweep_cfg.get("pause_seconds", 2.0)
     rot_revs = args.rot_revs if args.rot_revs is not None else sweep_cfg.get("rot_revs", 4.0)
 
     link = ModbusLink(port=port, baudrate=baud)
