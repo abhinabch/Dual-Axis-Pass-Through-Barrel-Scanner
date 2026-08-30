@@ -377,7 +377,7 @@ from hardware.run_precision_scan import (
     # perform_raster_sweep, # Removed in favor of scan_sequence
     PipelineError
 )
-from scan_sequence import run_scan_sequence, ModbusLink
+from scan_sequence import run_scan_sequence, ModbusLink, ESS17Controller, IDM57Controller
 from reconstruction.barrel_reconstruct import run_reconstruction_pipeline # Assumed entry point
 from reconstruction.barrel_batch import save_to_log # Assumed entry point
 from hardware.creality_autostart import CrealityAutomator, AutomationError
@@ -1087,19 +1087,41 @@ class AppGUI(ctk.CTk):
             self.after(2500, lambda: self.save_log_btn.configure(text="Save & Add to Log", state="normal", fg_color=["#3a7ebf", "#1f538d"]))
 
     def jog_axis(self, unit_id: int, revs: int):
-        """Manual jog for technician panel."""
+        """Manual jog for technician panel.
+
+        Routed through the same ESS17Controller/IDM57Controller the scan sequence
+        uses rather than the raw-client send_absolute_move() path. That path read
+        the tilt drive's position from an iDM57-only encoder register the ESS17
+        does not implement, so every tilt jog failed after burning the full
+        timeout budget. The controllers use per-drive registers and relative
+        moves, and go through ModbusLink's retry/flush layer.
+
+        Runs on a worker thread: the controllers block until the move completes,
+        and Tk's main loop must not be held for the duration of a jog.
+        """
         log.info("Jogging axis %d by %d revs", unit_id, revs)
-        if not self.client:
-            log.warning("Jog ignored: motor client is not connected.")
+        if self.link is None:
+            log.warning("Jog ignored: motor link is not connected.")
             return
-        try:
-            pulses_per_rev = PULSES_PER_REV_PAN if unit_id == UNIT_ID_PAN else PULSES_PER_REV_TILT
-            with self.modbus_lock:
-                curr = read_encoder_position(self.client, unit_id)
-                target = curr + (revs * pulses_per_rev)
-                send_absolute_move(self.client, unit_id, target)
-        except Exception as e:
-            log.error("Jog failed: %s", e)
+        if self._automation_active.is_set():
+            log.warning("Jog ignored: scanner automation is in progress.")
+            return
+
+        def _run_jog():
+            try:
+                if unit_id == UNIT_ID_TILT:
+                    ctrl = ESS17Controller(self.link, slave_id=unit_id)
+                    speed = self.scan_config.get("sweep_settings", {}).get("tilt_speed_rpm", 60)
+                else:
+                    ctrl = IDM57Controller(self.link, slave_id=unit_id)
+                    speed = self.scan_config.get("sweep_settings", {}).get("rot_speed_rpm", 60)
+
+                if not ctrl.move_relative(int(revs) * ctrl.PULSES_PER_REV, velocity_rpm=speed):
+                    log.error("Jog failed: move did not complete on axis %d.", unit_id)
+            except Exception as e:
+                log.error("Jog failed: %s", e)
+
+        threading.Thread(target=_run_jog, daemon=True).start()
 
     def _init_modbus_client(self, port: str, baud: int) -> bool:
         """
@@ -1114,7 +1136,13 @@ class AppGUI(ctk.CTk):
             except Exception:
                 pass
 
-        self.client = ModbusSerialClient(port=port, baudrate=baud, timeout=TIMEOUT)
+        # retries=1 (no internal pymodbus retry). ModbusLink already retries three
+        # times with an RX-buffer flush between attempts, which is the layer that
+        # can actually recover a desynced frame. Leaving pymodbus's default of 3 on
+        # top meant up to 9 wire attempts per logical operation, and a transaction
+        # to an unresponsive register held the shared bus lock for ~15-20s while it
+        # ground through them -- which is what stalled motion behind failed polls.
+        self.client = ModbusSerialClient(port=port, baudrate=baud, timeout=TIMEOUT, retries=1)
         connected = self.client.connect()
         self.link = ModbusLink(port=port, baudrate=baud, client=self.client, lock=self.modbus_lock)
         # A running watchdog captured the previous client by reference; leaving it

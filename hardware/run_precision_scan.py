@@ -128,8 +128,21 @@ class PipelineError(Exception):
 # ---------------------------------------------------------------------------
 
 def read_encoder_position(client: ModbusSerialClient, unit_id: int) -> int:
-    """Reads 32-bit signed feedback position from registers 0x602C and 0x602D."""
+    """Reads 32-bit signed feedback position from registers 0x602C and 0x602D.
+
+    iDM57 only. 0x602C/0x602D are iDM57 (Pr8.44/8.45) registers with no ESS17
+    equivalent in this map -- asking the tilt drive for them gets no reply and
+    burns the full retry/timeout budget. Callers wanting tilt position should use
+    ESS17Controller in scan_sequence.py, which tracks it in software.
+    """
+    if unit_id == UNIT_ID_TILT:
+        raise ModbusException(
+            "read_encoder_position() is iDM57-only; the ESS17 tilt drive has no "
+            "encoder feedback register at 0x602C. Use ESS17Controller instead."
+        )
     result = client.read_holding_registers(address=REG_ENCODER_H, count=2, device_id=unit_id)
+    if result is None:
+        raise ModbusException("No response reading encoder registers (transport down?)")
     if result.isError():
         raise ModbusException(f"Failed to read encoder registers: {result}")
     
@@ -143,7 +156,7 @@ def read_encoder_position(client: ModbusSerialClient, unit_id: int) -> int:
     return val
 
 def decode_status(word: int) -> dict:
-    """Decodes motor status bits."""
+    """Decodes iDM57-RS23 (pan/rotation) motor status bits."""
     return {
         "running": bool(word & (1 << 2)),
         "path_completed": bool(word & (1 << 5)),
@@ -151,9 +164,41 @@ def decode_status(word: int) -> dict:
         "enabled": bool(word & (1 << 1)),
     }
 
+def decode_status_tilt(word: int) -> dict:
+    """Decodes ESS17-RS04 (tilt) motor status bits.
+
+    The ESS17 bit assignment has nothing in common with the iDM57's. Notably its
+    bit 0 is "in position", where the iDM57's bit 0 is "faulty" -- so running an
+    ESS17 status word through decode_status() reports a fault every time the tilt
+    axis successfully reaches its target.
+    """
+    return {
+        "in_position": bool(word & (1 << 0)),
+        "running": bool(word & (1 << 2)),
+        "faulty": bool(word & (1 << 3)),        # alarm bit
+        "motor_released": bool(word & (1 << 4)),
+        # Presented so callers can treat both drives uniformly.
+        "enabled": not bool(word & (1 << 4)),
+        "path_completed": bool(word & (1 << 0)),
+    }
+
 def read_motor_status(client: ModbusSerialClient, unit_id: int) -> dict:
-    """Queries current motion state bitmask."""
-    result = client.read_holding_registers(address=STATUS_REGISTER, count=1, device_id=unit_id)
+    """Queries current motion state bitmask for either drive.
+
+    The two drives use DIFFERENT status registers and different bit layouts:
+    the iDM57 (pan, slave 1) reports at 0x1003, the ESS17 (tilt, slave 2) at
+    0x0007. Addressing 0x1003 to the ESS17 gets no reply at all -- the drive
+    simply does not answer -- so every tilt poll burned the full retry/timeout
+    budget (~15-20s) while holding the shared bus lock, stalling the scan
+    thread's own status polling behind it and turning 4-second moves into
+    21-second ones.
+    """
+    if unit_id == UNIT_ID_TILT:
+        address, decoder = TILT_STATUS_REG, decode_status_tilt
+    else:
+        address, decoder = STATUS_REGISTER, decode_status
+
+    result = client.read_holding_registers(address=address, count=1, device_id=unit_id)
     # pymodbus returns None (rather than an error response) when the transport is
     # down; calling .isError() on it raises AttributeError, which callers catching
     # ModbusException would miss.
@@ -161,11 +206,18 @@ def read_motor_status(client: ModbusSerialClient, unit_id: int) -> dict:
         raise ModbusException("No response reading status register (transport down?)")
     if result.isError():
         raise ModbusException(f"Failed to read status register: {result}")
-    return decode_status(result.registers[0])
+    return decoder(result.registers[0])
 
 def check_motor_alarm(client: ModbusSerialClient, unit_id: int) -> int:
-    """Queries current alarm code. Returns 0 if healthy."""
-    result = client.read_holding_registers(address=ALARM_REGISTER, count=1, device_id=unit_id)
+    """Queries current alarm code. Returns 0 if healthy.
+
+    Like the status register, the alarm register differs per drive: 0x1001 on the
+    iDM57, 0x0006 on the ESS17.
+    """
+    address = TILT_ERROR_REG if unit_id == UNIT_ID_TILT else ALARM_REGISTER
+    result = client.read_holding_registers(address=address, count=1, device_id=unit_id)
+    if result is None:
+        raise ModbusException("No response reading alarm register (transport down?)")
     if result.isError():
         raise ModbusException(f"Failed to read alarm register: {result}")
     return result.registers[0]
