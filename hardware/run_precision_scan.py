@@ -49,7 +49,13 @@ SERIAL_PORT = "COM3"
 BAUDRATE = 115200
 UNIT_ID_PAN = 1
 UNIT_ID_TILT = 2
-TIMEOUT = 2
+# Per-transaction Modbus timeout. Deliberately generous: the GUI runs Tk, the
+# CrealityScan screen-matching automation and the scan thread in one process, so a
+# serial reader thread can be descheduled for a noticeable stretch even though the
+# drive replied promptly. A timeout that expires while the reply is already sitting
+# in the RX buffer is what desyncs RTU framing, so err on the long side -- it costs
+# nothing when the bus is healthy.
+TIMEOUT = 5
 
 # Motor Calibration & Tuning
 PULSES_PER_REV_PAN = 10000              # Number of steps per full 360-degree rotation
@@ -148,6 +154,11 @@ def decode_status(word: int) -> dict:
 def read_motor_status(client: ModbusSerialClient, unit_id: int) -> dict:
     """Queries current motion state bitmask."""
     result = client.read_holding_registers(address=STATUS_REGISTER, count=1, device_id=unit_id)
+    # pymodbus returns None (rather than an error response) when the transport is
+    # down; calling .isError() on it raises AttributeError, which callers catching
+    # ModbusException would miss.
+    if result is None:
+        raise ModbusException("No response reading status register (transport down?)")
     if result.isError():
         raise ModbusException(f"Failed to read status register: {result}")
     return decode_status(result.registers[0])
@@ -235,6 +246,22 @@ class SafetyWatchdog:
         # lock object is ever shared with reentrant callers.
         import threading
         self.lock = lock if lock is not None else threading.RLock()
+        # Set while another subsystem needs exclusive use of the bus/CPU (e.g. the
+        # CrealityScan screen-matching automation). Polling is suspended rather than
+        # stopped so the watchdog resumes with the same thread and state.
+        self._paused = threading.Event()
+
+    def pause(self, reason: str = ""):
+        """Suspend polling without tearing the thread down."""
+        if not self._paused.is_set():
+            self._paused.set()
+            log.info("SafetyWatchdog paused%s.", f" ({reason})" if reason else "")
+
+    def resume(self):
+        """Resume polling after a pause()."""
+        if self._paused.is_set():
+            self._paused.clear()
+            log.info("SafetyWatchdog resumed.")
 
     def start(self):
         import threading
@@ -253,6 +280,9 @@ class SafetyWatchdog:
     def _run(self):
         consecutive_failures = 0
         while self._running:
+            if self._paused.is_set():
+                time.sleep(self.poll_interval)
+                continue
             try:
                 with self.lock:
                     # Check Pan Axis
@@ -281,20 +311,28 @@ class SafetyWatchdog:
             except Exception as e:
                 log.warning("SafetyWatchdog poll error: %s", e)
                 consecutive_failures += 1
-                # Repeated back-to-back failures usually mean the client-side serial
-                # connection has gotten stuck (stale/misaligned bytes sitting in the
-                # receive buffer after a timeout). Reopening it is cheap and clears
-                # that case; it will NOT recover a drive that has actually hung and
-                # needs a physical power cycle, but it's harmless to try either way.
-                if consecutive_failures >= 3:
-                    log.warning("SafetyWatchdog: %d consecutive poll failures, reconnecting client...", consecutive_failures)
-                    try:
-                        with self.lock:
-                            self.client.close()
-                            self.client.connect()
-                    except Exception as reconnect_err:
-                        log.warning("SafetyWatchdog: reconnect attempt failed: %s", reconnect_err)
-                    consecutive_failures = 0
+                # Deliberately NOT reconnecting the client here. This watchdog shares
+                # `client` with the scan thread (via ModbusLink) and the GUI's poll /
+                # jog paths. Closing and reopening it from this thread invalidates the
+                # serial handle the other users are about to reach for, which surfaced
+                # as "ClearCommError failed (OSError(9, 'The handle is invalid.'))" on
+                # scan-thread writes and amplified the very fault it was reacting to.
+                # Reconnection has exactly one owner: ModbusLink.ensure_connected().
+                # All we do here is clear the stale bytes that caused the desync.
+                try:
+                    with self.lock:
+                        sock = getattr(self.client, "socket", None)
+                        if sock is not None:
+                            sock.reset_input_buffer()
+                            sock.reset_output_buffer()
+                except Exception as flush_err:
+                    log.debug("SafetyWatchdog: buffer flush failed: %s", flush_err)
+
+                if consecutive_failures == 3:
+                    log.warning(
+                        "SafetyWatchdog: %d consecutive poll failures; leaving recovery "
+                        "to the scan link.", consecutive_failures
+                    )
 
             time.sleep(self.poll_interval)
 

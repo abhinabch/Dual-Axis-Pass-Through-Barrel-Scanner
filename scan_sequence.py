@@ -92,12 +92,32 @@ class ModbusLink:
             logger.warning("Modbus connection was closed by driver. Re-connecting...")
             self.client.connect()
 
-    # Default retry count/backoff for register transactions. Under GUI load (Tk
-    # mainloop + SafetyWatchdog polling thread + scan thread all fighting over the
-    # GIL and this same serial link), a single request/response can transiently
-    # miss its timeout window even though the drive answered fine -- retrying a
-    # couple of times with a short backoff recovers from that without having to
-    # guess at static settle delays.
+    def flush_serial(self):
+        """Discard any bytes sitting in the driver's RX/TX buffers.
+
+        This is the single most important recovery step after a timed-out
+        transaction. Modbus RTU has no framing delimiter -- a reply that arrives
+        after we stopped waiting for it stays in the OS receive buffer, and the
+        NEXT request then reads those stale bytes as its own reply. That shows up
+        as "request ask for id=2 but got id=250" and, critically, never
+        self-corrects: every subsequent transaction stays shifted by one frame
+        until the buffer is cleared. Retrying without flushing just re-reads the
+        same stale frame, which is why bare retries did not recover the bus.
+        """
+        sock = getattr(self.client, "socket", None)
+        if sock is None:
+            return
+        try:
+            sock.reset_input_buffer()
+            sock.reset_output_buffer()
+        except Exception as e:
+            logger.debug(f"Serial buffer flush failed (non-fatal): {e}")
+
+    # Default retry count/backoff for register transactions. A single
+    # request/response can transiently miss its timeout window even though the
+    # drive answered fine -- retrying a couple of times, after flushing the stale
+    # reply out of the receive buffer, recovers from that without having to guess
+    # at static settle delays.
     RETRY_ATTEMPTS = 2
     RETRY_DELAY_S = 0.2
 
@@ -114,6 +134,9 @@ class ModbusLink:
                         return result.registers[0]
                 except Exception as e:
                     logger.warning(f"Modbus read attempt {attempt}/{self.RETRY_ATTEMPTS + 1} raised for register {hex(address)} on Slave {slave_id}: {e}")
+                # Any failure may have left a late reply in the RX buffer; clear it
+                # so the retry reads its own response rather than the stale frame.
+                self.flush_serial()
                 if attempt <= self.RETRY_ATTEMPTS:
                     time.sleep(self.RETRY_DELAY_S)
             logger.error(f"Modbus read failed after {self.RETRY_ATTEMPTS + 1} attempts: register {hex(address)} on Slave {slave_id}")
@@ -132,6 +155,9 @@ class ModbusLink:
                         return True
                 except Exception as e:
                     logger.warning(f"Modbus write attempt {attempt}/{self.RETRY_ATTEMPTS + 1} raised for register {hex(address)} on Slave {slave_id}: {e}")
+                # Any failure may have left a late reply in the RX buffer; clear it
+                # so the retry reads its own response rather than the stale frame.
+                self.flush_serial()
                 if attempt <= self.RETRY_ATTEMPTS:
                     time.sleep(self.RETRY_DELAY_S)
             logger.error(f"Modbus write failed after {self.RETRY_ATTEMPTS + 1} attempts: register {hex(address)} on Slave {slave_id}, value {value}")
@@ -150,6 +176,9 @@ class ModbusLink:
                         return True
                 except Exception as e:
                     logger.warning(f"Modbus write attempt {attempt}/{self.RETRY_ATTEMPTS + 1} raised for registers from {hex(address)} on Slave {slave_id}: {e}")
+                # Any failure may have left a late reply in the RX buffer; clear it
+                # so the retry reads its own response rather than the stale frame.
+                self.flush_serial()
                 if attempt <= self.RETRY_ATTEMPTS:
                     time.sleep(self.RETRY_DELAY_S)
             logger.error(f"Modbus write failed after {self.RETRY_ATTEMPTS + 1} attempts: registers from {hex(address)} on Slave {slave_id}, values {values}")

@@ -2,6 +2,7 @@ import tkinter as tk
 import customtkinter as ctk
 import threading
 import queue
+import contextlib
 import time
 import logging
 import math
@@ -393,6 +394,9 @@ from config_manager import (
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("OperatorDashboard")
 
+# How often the dashboard re-checks turret/scanner connectivity, in milliseconds.
+POLL_INTERVAL_MS = 5000
+
 class AppState(Enum):
     READY = auto()
     SCANNING = auto()
@@ -431,6 +435,13 @@ class AppGUI(ctk.CTk):
         # each other's request/response frames on the wire (garbled slave IDs,
         # timeouts, eventual forced connection close).
         self.modbus_lock = threading.Lock()
+        # Set while the CrealityScan screen-matching automation is running. That
+        # automation grabs and template-matches the full screen in a loop, which is
+        # CPU-heavy enough to deschedule the serial threads past their Modbus
+        # timeout -- the reply is then read as the NEXT request's response and RTU
+        # framing desyncs for the rest of the run. Motion and GUI automation never
+        # need to overlap, so we suspend all Modbus polling for its duration.
+        self._automation_active = threading.Event()
         self.automator = CrealityAutomator()
         self.worker_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -822,8 +833,15 @@ class AppGUI(ctk.CTk):
         self.stop_event.set()
         
         # Stop Creality scanner process
+        def _stop_scanner():
+            try:
+                with self.gui_automation("CrealityScan stop sequence"):
+                    self.automator.stop_scan()
+            except Exception as e:
+                log.warning("Failed to stop Creality Scan software: %s", e)
+
         try:
-            threading.Thread(target=self.automator.stop_scan, daemon=True).start()
+            threading.Thread(target=_stop_scanner, daemon=True).start()
         except Exception as e:
             log.warning("Failed to stop Creality Scan software: %s", e)
 
@@ -839,6 +857,25 @@ class AppGUI(ctk.CTk):
         handle_pipeline_error() directly from that thread.
         """
         self.worker_queue.put(WorkerMessage('error', error=error))
+
+    @contextlib.contextmanager
+    def gui_automation(self, reason: str):
+        """Run CrealityScan screen automation with all Modbus polling suspended.
+
+        Both the SafetyWatchdog and poll_connections() are quiesced for the
+        duration. Nothing is moving while the scanner UI is being driven, so there
+        is no safety value in polling through it -- and polling through it is what
+        broke the bus (see self._automation_active).
+        """
+        self._automation_active.set()
+        if self.watchdog:
+            self.watchdog.pause(reason)
+        try:
+            yield
+        finally:
+            self._automation_active.clear()
+            if self.watchdog:
+                self.watchdog.resume()
 
     def start_pipeline(self):
         """Launch the background worker for the scan pipeline."""
@@ -880,7 +917,8 @@ class AppGUI(ctk.CTk):
             # of silently continuing as if the scan had started.
             log.info("Triggering Creality Scan autostart sequence...")
             try:
-                self.automator.start_scan()
+                with self.gui_automation("CrealityScan start sequence"):
+                    self.automator.start_scan()
             except Exception as scan_err:
                 raise PipelineError(
                     f"Failed to start Creality Scan capture: {scan_err}"
@@ -893,7 +931,8 @@ class AppGUI(ctk.CTk):
             run_scan_sequence(self.link, config=self.scan_config, progress_callback=progress_cb)
             # Stop scan in scanner UI
             try:
-                self.automator.stop_scan()
+                with self.gui_automation("CrealityScan stop sequence"):
+                    self.automator.stop_scan()
             except Exception as stop_err:
                 log.warning("Creality Scan stop note: %s", stop_err)
 
@@ -904,7 +943,8 @@ class AppGUI(ctk.CTk):
             # Export scan file via CrealityAutomator
             barrel_id_str = self.barrel_id.get().strip() if self.barrel_id.get() else "default"
             try:
-                scan_file_path = self.automator.export_scan(barrel_id=barrel_id_str)
+                with self.gui_automation("CrealityScan export sequence"):
+                    scan_file_path = self.automator.export_scan(barrel_id=barrel_id_str)
             except Exception as exp_err:
                 log.warning("Creality export fallback: %s", exp_err)
                 scan_file_path = "saved_creality_files/fallback.obscan"
@@ -1077,6 +1117,10 @@ class AppGUI(ctk.CTk):
         self.client = ModbusSerialClient(port=port, baudrate=baud, timeout=TIMEOUT)
         connected = self.client.connect()
         self.link = ModbusLink(port=port, baudrate=baud, client=self.client, lock=self.modbus_lock)
+        # A running watchdog captured the previous client by reference; leaving it
+        # pointed at the closed one would make it poll a dead handle forever.
+        if self.watchdog is not None:
+            self.watchdog.client = self.client
         return connected
 
     def apply_settings(self):
@@ -1108,19 +1152,37 @@ class AppGUI(ctk.CTk):
 
     def poll_connections(self):
         """Periodically check connection status of turret and scanner."""
+        # While the scanner UI is being driven, stay off the bus entirely and leave
+        # the indicators showing their last known state -- a poll here competes with
+        # the screen-matching loop for CPU and is exactly what desynced RTU framing.
+        if self._automation_active.is_set():
+            self.after(POLL_INTERVAL_MS, self.poll_connections)
+            return
+
         log.info("Polling connections...")
-        
+
         # 1. Check Turret Connectivity (Modbus)
         turret_ok = False
         try:
+            m_cfg = self.scan_config.get("motor_settings", {})
             if self.client is None:
                 # Try to initialize client if it doesn't exist, using the configured
                 # port/baud from scan_config.json (falls back to hardware defaults).
-                m_cfg = self.scan_config.get("motor_settings", {})
                 self._init_modbus_client(
                     m_cfg.get("port", SERIAL_PORT),
                     m_cfg.get("baudrate", BAUDRATE),
                 )
+            elif not self.client.connected:
+                # pymodbus closes the connection itself after repeated failures
+                # ("CLOSING CONNECTION"), which leaves self.client non-None but
+                # permanently unusable. Without this branch the only recovery was
+                # restarting the app -- the turret indicator stayed red forever.
+                log.warning("Modbus client is closed; reopening.")
+                with self.modbus_lock:
+                    self._init_modbus_client(
+                        m_cfg.get("port", SERIAL_PORT),
+                        m_cfg.get("baudrate", BAUDRATE),
+                    )
 
             if self.client.connected:
                 # Try to read a status register to verify actual communication
@@ -1161,7 +1223,7 @@ class AppGUI(ctk.CTk):
             self.start_btn.configure(state="normal" if ready_ok else "disabled")
         
         # Schedule next poll in 5 seconds
-        self.after(5000, self.poll_connections)
+        self.after(POLL_INTERVAL_MS, self.poll_connections)
 
     def process_queue(self):
         """Process messages from the background worker thread."""

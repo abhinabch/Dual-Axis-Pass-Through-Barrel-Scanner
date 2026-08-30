@@ -60,7 +60,11 @@ class CrealityAutomator:
         template_base_dir: str = "templates",
         confidence: float = 0.85,
         click_timeout: float = 20.0,
-        poll_interval: float = 0.5,
+        # Each poll grabs the screen and runs template matching. Backing this off
+        # from 0.5s leaves headroom for the Tk main loop and the Modbus threads
+        # sharing this process; UI elements we wait on appear on human timescales,
+        # so a 1s cadence costs nothing in practice.
+        poll_interval: float = 1.0,
         save_dir: str = "saved_creality_files",
     ):
         self.template_base_dir = os.path.abspath(template_base_dir)
@@ -137,17 +141,32 @@ class CrealityAutomator:
         A single fixed confidence is brittle across Creality Scan UI theme/version
         changes (icon anti-aliasing, colour shifts). This widens the search without
         weakening the default confidence used elsewhere (export dialogs, etc.).
+
+        All variants are matched against ONE screen grab held in memory. The
+        previous version called locateCenterOnScreen() per variant, and each of
+        those takes its own full-screen screenshot -- 8 grabs per poll on a miss.
+        Repeated at the poll interval for the length of a 60s timeout, that
+        saturated the CPU badly enough to stall the Tk main loop for ~60s and push
+        Modbus reads past their timeout while the drives' replies were already in
+        the receive buffer, desyncing RTU framing for the rest of the run. Matching
+        is cheap; grabbing the screen is not.
         """
-        for conf_try in (base_confidence, 0.8, 0.75, 0.7):
+        try:
+            haystack = pyautogui.screenshot()
+        except Exception as e:
+            log.debug("Screen grab failed during match: %s", e)
+            return None, None, None
+
+        for conf_try in (base_confidence, 0.78, 0.7):
             for grayscale in (False, True):
                 try:
-                    location = pyautogui.locateCenterOnScreen(
-                        template_path, confidence=conf_try, grayscale=grayscale
+                    box = pyautogui.locate(
+                        template_path, haystack, confidence=conf_try, grayscale=grayscale
                     )
                 except Exception:
-                    location = None
-                if location is not None:
-                    return location, conf_try, grayscale
+                    box = None
+                if box is not None:
+                    return pyautogui.center(box), conf_try, grayscale
         return None, None, None
 
     def _save_debug_screenshot(self, tag: str) -> Optional[str]:
@@ -339,8 +358,17 @@ class CrealityAutomator:
         )
 
     def capture_template_from_screen(self, template_name: str) -> Optional[str]:
-        """Capture a candidate template from the current screen and save it to the
-        active resolution folder (and debug folder). Returns the saved path or None.
+        """Capture a candidate template from the current screen into debug/ only.
+
+        Returns the saved candidate path, or None.
+
+        This deliberately does NOT write into the templates/ tree. It used to save
+        over the canonical template (e.g. templates/1280x800/ready_text.png) using
+        whatever happened to be on screen at the moment of a timeout -- so a single
+        failed match permanently replaced a known-good template with a crop of the
+        wrong UI state. That silently poisoned the template set for every later run
+        and made the automation progressively less reliable. Candidates now land in
+        debug/ for a human to inspect and promote by hand if they are actually good.
 
         The capture crops a top-centered band of the screen where the ready banner
         typically appears; sizes are clamped to the current screen size.
@@ -356,17 +384,17 @@ class CrealityAutomator:
 
             crop = img.crop((crop_x, crop_y, crop_x + crop_w, crop_y + crop_h))
 
-            target_folder = self.active_resolution_folder or self.template_base_dir
-            os.makedirs(target_folder, exist_ok=True)
-            target_path = os.path.join(target_folder, template_name)
-            crop.save(target_path)
-
             dbg_name = f"auto_capture_{template_name.replace('.', '_')}_{int(time.time())}.png"
             dbg_path = os.path.join(self.debug_dir, dbg_name)
             crop.save(dbg_path)
 
-            log.info("Auto-captured template saved to %s (debug: %s)", target_path, dbg_path)
-            return target_path
+            log.info(
+                "Auto-captured candidate for '%s' saved to %s. The stored template was "
+                "NOT modified -- inspect this crop and copy it over the template "
+                "manually if it is correct.",
+                template_name, dbg_path,
+            )
+            return dbg_path
         except Exception as e:
             log.debug("Auto-capture failed: %s", e)
             return None
