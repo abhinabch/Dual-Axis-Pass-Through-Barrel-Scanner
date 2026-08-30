@@ -113,8 +113,34 @@ class CrealityAutomator:
         except Exception:
             return False
 
+    @staticmethod
+    def _foreground_state(win):
+        """True/False if the window is/isn't foreground, None if undeterminable."""
+        try:
+            active = gw.getActiveWindow()
+        except Exception:
+            return None
+        if active is None:
+            return None
+        try:
+            return active.title == win.title
+        except Exception:
+            return None
+
     def focus_window(self) -> None:
-        """Find the Creality Scan window and bring it to the foreground."""
+        """Find the Creality Scan window and bring it to the foreground.
+
+        pygetwindow's activate() calls Win32 SetForegroundWindow and raises
+        whenever it returns falsy -- including when the window is ALREADY in the
+        foreground, which surfaces as the self-contradictory "Error code from
+        Windows: 0 - The operation completed successfully." Windows also refuses
+        foreground changes outright under its focus-stealing rules.
+
+        Treating that exception as fatal meant stop_scan() and export_scan() threw
+        before doing anything, so a completed scan was never saved and the pipeline
+        fell through to the placeholder fallback.obscan. Judge by whether the
+        window actually ended up foreground, not by whether activate() threw.
+        """
         match = self._find_window_title()
         if match is None:
             raise AutomationError(
@@ -124,13 +150,39 @@ class CrealityAutomator:
 
         win = gw.getWindowsWithTitle(match)[0]
         if win.isMinimized:
-            win.restore()
-        win.activate()
+            try:
+                win.restore()
+                time.sleep(0.3)
+            except Exception as e:
+                log.debug("Restore reported: %s", e)
+
+        if self._foreground_state(win) is not True:
+            for attempt in range(1, 4):
+                try:
+                    win.activate()
+                except Exception as e:
+                    log.debug("activate() attempt %d reported: %s", attempt, e)
+                time.sleep(0.3)
+                state = self._foreground_state(win)
+                if state is not False:
+                    # True (confirmed foreground) or None (can't tell -- proceed
+                    # rather than block on an unreliable probe).
+                    break
+            else:
+                raise AutomationError(
+                    f"Could not bring '{match}' to the foreground after 3 attempts. "
+                    "Another window may be holding focus (a dialog, screen saver, or "
+                    "UAC prompt). Clicks and keystrokes would land in the wrong app."
+                )
+
         if not win.isMaximized:
             # Template images are captured against a full-screen window (folders are
             # named by resolution). A non-maximized window renders the UI at a
             # different scale/position, so template matching silently fails.
-            win.maximize()
+            try:
+                win.maximize()
+            except Exception as e:
+                log.debug("maximize() reported: %s", e)
             time.sleep(0.5)
         time.sleep(0.5)
         log.info("Focused window: %s", win.title)

@@ -405,8 +405,20 @@ def _init_led_controller(led_cfg):
     LED rig never blocks the motor scan sequence.
     """
     if not led_cfg or not led_cfg.get("enabled", False):
+        # Say so explicitly. Returning None silently made a disabled rig
+        # indistinguishable from a broken one -- the scan log showed nothing at all
+        # about LEDs either way.
+        logger.info(
+            "LED control is disabled in config (led_settings.enabled = false); "
+            "running scan without LEDs."
+        )
         return None
 
+    logger.info(
+        "Connecting to LED controller on %s @ %s baud (slave %s, channel %s)...",
+        led_cfg.get("port", "COM4"), led_cfg.get("baudrate", 9600),
+        led_cfg.get("slave_id", 1), led_cfg.get("channel", 1),
+    )
     try:
         ctrl = WavesharePwmController(
             port=led_cfg.get("port", "COM4"),
