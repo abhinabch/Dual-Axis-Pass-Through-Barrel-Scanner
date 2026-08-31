@@ -309,6 +309,28 @@ class WavesharePwmController:
         log_msg(f"Channel {channel} Readback -> Frequency: {freq_hz:.2f} Hz, Duty Cycle: {duty_pct:.2f}%")
         return freq_hz, duty_pct
 
+    def set_slave_address(self, new_address: int) -> None:
+        """Reprogram the board's Modbus slave address (register 0x4000).
+
+        Needed when the board shares an RS485 bus with other devices: its factory
+        default of 1 collides with the iDM57 rotation drive, and two devices
+        answering one address makes the bus unusable.
+
+        The write is addressed to the board's CURRENT slave id; afterwards it
+        responds only on the new one.
+        """
+        if not 1 <= int(new_address) <= 255:
+            raise ValueError(f"Slave address must be 1-255, got {new_address}")
+        log_msg(
+            f"Setting device slave address 0x4000: {self.slave_id} -> {new_address} ..."
+        )
+        self.write_single_register(REG_SLAVE_ADDRESS, int(new_address))
+        log_msg(
+            f"Slave address written. The board now answers as ID {new_address}; "
+            f"re-run --verify with --slave-id {new_address} to confirm."
+        )
+        self.slave_id = int(new_address)
+
     def verify_device(self) -> bool:
         """Read slave address (0x4000) and firmware version (0x8000)."""
         log_msg("--- Pre-wiring Hardware Verification ---")
@@ -405,6 +427,12 @@ def main():
     parser.add_argument("--verify", action="store_true", help="Run pre-wiring test & verification procedure")
     parser.add_argument("--demo", action="store_true", help="Run 3-level 5-second brightness demo (default behavior if no mode specified)")
     parser.add_argument("--list-ports", action="store_true", help="List available system serial COM ports and exit")
+    parser.add_argument(
+        "--set-slave-id", type=int, default=None, metavar="NEW_ID",
+        help="Reprogram the board's Modbus slave address (1-255) and exit. Use when "
+             "the board shares an RS485 bus with the drives -- its default of 1 "
+             "collides with the rotation motor. Addressed to the CURRENT --slave-id.",
+    )
 
     args = parser.parse_args()
 
@@ -428,7 +456,9 @@ def main():
     try:
         controller.connect()
 
-        if args.verify:
+        if args.set_slave_id is not None:
+            controller.set_slave_address(args.set_slave_id)
+        elif args.verify:
             run_verification_procedure(controller, args.channel)
         elif args.duty is not None:
             log_msg(f"Static Control: Setting Channel {args.channel} Freq={args.freq}Hz, Duty={args.duty}%")
