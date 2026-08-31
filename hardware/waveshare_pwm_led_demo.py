@@ -309,6 +309,49 @@ class WavesharePwmController:
         log_msg(f"Channel {channel} Readback -> Frequency: {freq_hz:.2f} Hz, Duty Cycle: {duty_pct:.2f}%")
         return freq_hz, duty_pct
 
+    # Baud rate index written to the low byte of register 0x2000. The order is the
+    # one Waveshare's own product page lists the supported rates in. The high byte
+    # is the parity selector; 0 = none, matching the 8N1 this module ships with.
+    #
+    # NOTE: this mapping is NOT confirmed against Waveshare's protocol document
+    # (their wiki blocks automated fetches and the PDF is image-only). If a write
+    # lands wrong the board is not bricked -- it is just answering at some other
+    # setting. Recover by sweeping: for each baud in BAUD_INDEX, run
+    #   python hardware/waveshare_pwm_led_demo.py --verify --port COM3 --baud <b> --slave-id <id>
+    # until one responds, then rewrite from there.
+    BAUD_INDEX = {
+        4800: 0, 9600: 1, 19200: 2, 38400: 3,
+        57600: 4, 115200: 5, 128000: 6, 256000: 7,
+    }
+    PARITY_NONE = 0
+
+    def set_baud_rate(self, new_baud: int) -> None:
+        """Reprogram the board's serial baud rate (register 0x2000).
+
+        Needed when the board shares an RS485 bus with other devices: one bus runs
+        at one baud rate, so the board's 9600 default cannot coexist with drives
+        running at 115200.
+
+        The write is addressed at the CURRENT baud; the board answers at the new
+        one immediately afterwards, so the confirming read must reconnect.
+        """
+        if int(new_baud) not in self.BAUD_INDEX:
+            raise ValueError(
+                f"Unsupported baud {new_baud}. Supported: {sorted(self.BAUD_INDEX)}"
+            )
+        idx = self.BAUD_INDEX[int(new_baud)]
+        value = (self.PARITY_NONE << 8) | idx
+        log_msg(
+            f"Setting serial parameters 0x2000: baud {self.baudrate} -> {new_baud} "
+            f"(index {idx}, parity none) = 0x{value:04X}"
+        )
+        log_msg(
+            "After this write the board stops answering at the old baud rate. "
+            "Reconnect with --baud %d to confirm." % int(new_baud)
+        )
+        self.write_single_register(REG_BAUD_ADDRESS, value)
+        log_msg("Baud rate register written.")
+
     def set_slave_address(self, new_address: int) -> None:
         """Reprogram the board's Modbus slave address (register 0x4000).
 
@@ -433,6 +476,13 @@ def main():
              "the board shares an RS485 bus with the drives -- its default of 1 "
              "collides with the rotation motor. Addressed to the CURRENT --slave-id.",
     )
+    parser.add_argument(
+        "--set-baud", type=int, default=None, metavar="NEW_BAUD",
+        choices=sorted(WavesharePwmController.BAUD_INDEX),
+        help="Reprogram the board's baud rate (register 0x2000) and exit. Needed when "
+             "the board shares a bus with the drives -- one bus runs at one baud rate. "
+             "Written at the CURRENT --baud; reconnect at the new one to confirm.",
+    )
 
     args = parser.parse_args()
 
@@ -458,6 +508,8 @@ def main():
 
         if args.set_slave_id is not None:
             controller.set_slave_address(args.set_slave_id)
+        elif args.set_baud is not None:
+            controller.set_baud_rate(args.set_baud)
         elif args.verify:
             run_verification_procedure(controller, args.channel)
         elif args.duty is not None:
@@ -478,8 +530,17 @@ def main():
             log_msg("No active serial COM ports found on system. Check USB connection and driver.")
         sys.exit(1)
     finally:
-        # Safe resting state: Turn off PWM duty cycle if connected before exiting
-        if controller.is_connected():
+        # Safe resting state: Turn off PWM duty cycle if connected before exiting.
+        # Skipped after a baud change -- the board has already moved to the new rate,
+        # so this connection can no longer reach it and the cleanup would just log a
+        # confusing timeout.
+        if args.set_baud is not None:
+            log_msg(
+                "Skipping duty-cycle cleanup: the board has switched to %d baud. "
+                "Confirm with: --verify --port %s --baud %d --slave-id %d"
+                % (args.set_baud, args.port, args.set_baud, controller.slave_id)
+            )
+        elif controller.is_connected():
             try:
                 log_msg(f"Safety Cleanup: Setting Channel {args.channel} Duty Cycle to 0.0% (LED Off)...")
                 controller.set_channel_duty(args.channel, 0.0)
