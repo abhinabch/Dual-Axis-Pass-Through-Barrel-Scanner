@@ -152,22 +152,51 @@ def list_available_ports() -> List[str]:
 # Modbus PWM Controller Class
 # ---------------------------------------------------------------------------
 class WavesharePwmController:
-    def __init__(self, port: str, baudrate: int = 9600, slave_id: int = 1, timeout: float = 2.0):
+    def __init__(self, port: str, baudrate: int = 9600, slave_id: int = 1, timeout: float = 2.0,
+                 client=None, lock=None):
+        """PWM board controller.
+
+        `client` / `lock`: when the board sits on the SAME RS485 bus as the stepper
+        drives (the usual wiring -- one USB-RS485 adapter, one pair of wires, several
+        slave IDs), it must share their pymodbus client and their lock rather than
+        opening a second handle. Windows will not let two handles hold one COM port,
+        and two threads transacting on one half-duplex bus corrupt each other's
+        frames. Standalone use (the CLI demo) passes neither and gets its own
+        connection as before.
+
+        Note that a shared bus means a shared baud rate: the board's 9600 default
+        has to be reprogrammed to match the drives, or nothing on the bus works.
+        """
         self.port = port
         self.baudrate = baudrate
         self.slave_id = slave_id
         self.timeout = timeout
-        self.client = ModbusSerialClient(
-            port=self.port,
-            baudrate=self.baudrate,
-            parity="N",
-            stopbits=1,
-            bytesize=8,
-            timeout=self.timeout,
-        )
+        self._owns_client = client is None
+        if client is not None:
+            self.client = client
+        else:
+            self.client = ModbusSerialClient(
+                port=self.port,
+                baudrate=self.baudrate,
+                parity="N",
+                stopbits=1,
+                bytesize=8,
+                timeout=self.timeout,
+            )
+        if lock is None:
+            import threading
+            lock = threading.Lock()
+        self.lock = lock
 
     def connect(self) -> None:
         """Establish serial Modbus RTU connection."""
+        if not self._owns_client:
+            # Borrowed connection -- the owner opened it and keeps it open.
+            log_msg(
+                f"Using shared {self.port} connection at {self.baudrate} 8N1 "
+                f"(Slave ID: {self.slave_id})."
+            )
+            return
         log_msg(f"Connecting to {self.port} at {self.baudrate} 8N1 (Slave ID: {self.slave_id})...")
         if not self.client.connect():
             raise ConnectionError(
@@ -181,6 +210,9 @@ class WavesharePwmController:
 
     def close(self) -> None:
         """Close serial Modbus connection safely."""
+        if not self._owns_client:
+            # Never close a borrowed client -- the motors are still using it.
+            return
         if self.is_connected():
             self.client.close()
             log_msg(f"Closed connection to {self.port}.")
@@ -190,7 +222,8 @@ class WavesharePwmController:
         try:
             # pymodbus 3.x compatibility: pass device_id parameter
             kwargs["device_id"] = self.slave_id
-            response = action_func(*args, **kwargs)
+            with self.lock:
+                response = action_func(*args, **kwargs)
 
             if response is None:
                 raise ModbusException("No response received from slave (Timeout).")

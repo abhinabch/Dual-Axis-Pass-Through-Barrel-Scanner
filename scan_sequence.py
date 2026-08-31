@@ -397,12 +397,18 @@ from hardware.waveshare_pwm_led_demo import WavesharePwmController
 # ---------------------------------------------------------------------------
 # LED Brightness Control (Waveshare Modbus RTU PWM Output 4CH)
 # ---------------------------------------------------------------------------
-def _init_led_controller(led_cfg):
+def _init_led_controller(led_cfg, link=None, motor_slave_ids=()):
     """
     Connects to the Waveshare PWM LED controller and primes the configured
     channel with its frequency and 'entire movement' baseline brightness.
     Returns None (instead of raising) on any failure so a missing/misconfigured
     LED rig never blocks the motor scan sequence.
+
+    When the LED board is wired to the same RS485 bus as the drives -- the normal
+    setup, one USB-RS485 adapter serving several slave IDs -- pass `link` so the
+    controller borrows that already-open connection and its lock. Opening a second
+    handle to the same COM port fails outright on Windows, and transacting on the
+    same half-duplex bus from two threads corrupts frames.
     """
     if not led_cfg or not led_cfg.get("enabled", False):
         # Say so explicitly. Returning None silently made a disabled rig
@@ -414,16 +420,48 @@ def _init_led_controller(led_cfg):
         )
         return None
 
-    logger.info(
-        "Connecting to LED controller on %s @ %s baud (slave %s, channel %s)...",
-        led_cfg.get("port", "COM4"), led_cfg.get("baudrate", 9600),
-        led_cfg.get("slave_id", 1), led_cfg.get("channel", 1),
-    )
+    led_port = led_cfg.get("port", "COM4")
+    led_baud = led_cfg.get("baudrate", 9600)
+    led_slave = led_cfg.get("slave_id", 1)
+
+    # Does the board sit on the drives' bus? If so, borrow their connection.
+    shared_client = None
+    shared_lock = None
+    if link is not None and str(led_port).strip().upper() == str(link.port).strip().upper():
+        if led_slave in motor_slave_ids:
+            logger.error(
+                "LED slave ID %s collides with a motor on the same bus (%s, motor IDs %s). "
+                "Two devices answering one address makes the bus unusable -- reprogram the "
+                "PWM board's address (register 0x4000) to a free ID. Continuing without LEDs.",
+                led_slave, led_port, sorted(motor_slave_ids),
+            )
+            return None
+        if int(led_baud) != int(link.baudrate):
+            logger.warning(
+                "LED baud rate (%s) differs from the motor bus (%s) but both are on %s. "
+                "One RS485 bus runs at ONE baud rate -- the board will not answer until it "
+                "is reprogrammed (register 0x2000) to %s. Trying anyway.",
+                led_baud, link.baudrate, led_port, link.baudrate,
+            )
+        shared_client = link.client
+        shared_lock = link.lock
+        logger.info(
+            "LED board shares the motor bus on %s; reusing the open connection "
+            "(slave %s, channel %s).", led_port, led_slave, led_cfg.get("channel", 1),
+        )
+    else:
+        logger.info(
+            "Connecting to LED controller on %s @ %s baud (slave %s, channel %s)...",
+            led_port, led_baud, led_slave, led_cfg.get("channel", 1),
+        )
+
     try:
         ctrl = WavesharePwmController(
-            port=led_cfg.get("port", "COM4"),
-            baudrate=led_cfg.get("baudrate", 9600),
-            slave_id=led_cfg.get("slave_id", 1),
+            port=led_port,
+            baudrate=led_baud,
+            slave_id=led_slave,
+            client=shared_client,
+            lock=shared_lock,
         )
         ctrl.connect()
         ctrl.set_channel_config(
@@ -510,7 +548,9 @@ def run_scan_sequence(
         tilt_targets = sweep_cfg.get("tilt_targets_pulses", [-8000, -4000, 0, 2000, 5000])
 
     led_cfg = config.get("led_settings", {})
-    led_ctrl = _init_led_controller(led_cfg)
+    led_ctrl = _init_led_controller(
+        led_cfg, link=link, motor_slave_ids={tilt_slave, rot_slave}
+    )
     if led_ctrl is not None:
         _notify(
             f"LEDs on (Slave {led_cfg.get('slave_id', 1)}, Ch{led_cfg.get('channel', 1)}) "
