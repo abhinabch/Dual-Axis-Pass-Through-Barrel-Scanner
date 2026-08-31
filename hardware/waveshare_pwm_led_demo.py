@@ -148,6 +148,62 @@ def list_available_ports() -> List[str]:
         return []
 
 
+def scan_bus(port: str, slave_ids, bauds=None, timeout: float = 0.3) -> List[dict]:
+    """Probe every (baud rate, slave id) pair on `port` and report what answers.
+
+    Built for a shared RS485 bus, where "which baud and which address is this
+    board on?" is the question you actually need answered -- after a slave-address
+    or baud-rate write, or when adding a device alongside the drives. Doing this
+    by hand means re-running --verify in a loop, ~16s per miss, with alarming
+    error spew for every combination that isn't there.
+
+    Two kinds of hit are reported, and the difference matters:
+      - "PWM board": register 0x4000 read back cleanly and echoed the address, so
+        this is a Waveshare board.
+      - "device present": something answered but rejected 0x4000, i.e. another
+        device (a stepper drive) lives at that address.
+
+    Short timeout, single attempt, so a full 8-baud x 8-address sweep is seconds.
+    """
+    if bauds is None:
+        bauds = sorted(WavesharePwmController.BAUD_INDEX)
+    found = []
+    for baud in bauds:
+        client = ModbusSerialClient(
+            port=port, baudrate=baud, parity="N", stopbits=1, bytesize=8,
+            timeout=timeout, retries=1,
+        )
+        if not client.connect():
+            log_msg(f"  {baud:>6} baud: could not open {port}")
+            continue
+        try:
+            for sid in slave_ids:
+                try:
+                    rr = client.read_holding_registers(
+                        address=REG_SLAVE_ADDRESS, count=1, device_id=sid
+                    )
+                except Exception:
+                    continue
+                if rr is None:
+                    continue
+                if rr.isError():
+                    # Answered, but does not implement 0x4000 -- not a PWM board.
+                    found.append({"baud": baud, "slave_id": sid, "kind": "device present"})
+                    log_msg(f"  {baud:>6} baud, ID {sid:>3}: device present (not a PWM board)")
+                    continue
+                echoed = rr.registers[0]
+                found.append({
+                    "baud": baud, "slave_id": sid, "kind": "PWM board", "reports": echoed,
+                })
+                log_msg(
+                    f"  {baud:>6} baud, ID {sid:>3}: PWM board "
+                    f"(0x4000 reports {echoed})"
+                )
+        finally:
+            client.close()
+    return found
+
+
 # ---------------------------------------------------------------------------
 # Modbus PWM Controller Class
 # ---------------------------------------------------------------------------
@@ -477,6 +533,16 @@ def main():
              "collides with the rotation motor. Addressed to the CURRENT --slave-id.",
     )
     parser.add_argument(
+        "--scan-bus", action="store_true",
+        help="Probe every baud rate x slave id on --port and report what answers, "
+             "then exit. Use to find the board after a slave-address or baud-rate "
+             "change, or to check for address collisions on a shared RS485 bus.",
+    )
+    parser.add_argument(
+        "--scan-ids", default="1-8", metavar="RANGE",
+        help="Slave ids for --scan-bus, e.g. '1-8' or '1,3,5' (default: 1-8).",
+    )
+    parser.add_argument(
         "--set-baud", type=int, default=None, metavar="NEW_BAUD",
         choices=sorted(WavesharePwmController.BAUD_INDEX),
         help="Reprogram the board's baud rate (register 0x2000) and exit. Needed when "
@@ -485,6 +551,26 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.scan_bus:
+        spec = args.scan_ids.strip()
+        if "-" in spec and "," not in spec:
+            lo, hi = spec.split("-", 1)
+            ids = list(range(int(lo), int(hi) + 1))
+        else:
+            ids = [int(x) for x in spec.split(",") if x.strip()]
+        log_msg(f"Scanning {args.port}: {len(ids)} address(es) x 8 baud rates...")
+        hits = scan_bus(args.port, ids)
+        if hits:
+            log_msg("--- Devices found ---")
+            for h in hits:
+                log_msg(f"  {h['baud']} baud, slave id {h['slave_id']}: {h['kind']}")
+        else:
+            log_msg(
+                "Nothing answered on any baud rate or address. Check the A+/B- wiring, "
+                "the adapter, and that the device is powered."
+            )
+        return
 
     if args.list_ports:
         ports = list_available_ports()
