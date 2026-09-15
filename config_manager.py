@@ -52,7 +52,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "freq_hz": 1000.0,
         "overall_brightness_pct": 40.0,
         "tilt_pass_brightness_pct": 70.0,
-        "rotation_brightness_pct": 100.0
+        "rotation_brightness_pct": 100.0,
+        "manual_brightness_pct": 100.0
     }
 }
 
@@ -102,7 +103,10 @@ def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
             config["reconstruction_settings"]["cleanup_mode"] = "rules"
 
         # Clamp LED brightness percentages to the valid 0-100% duty cycle range.
-        for pct_key in ("overall_brightness_pct", "tilt_pass_brightness_pct", "rotation_brightness_pct"):
+        for pct_key in (
+            "overall_brightness_pct", "tilt_pass_brightness_pct",
+            "rotation_brightness_pct", "manual_brightness_pct",
+        ):
             try:
                 pct_val = float(config["led_settings"].get(pct_key, 0.0))
             except (TypeError, ValueError):

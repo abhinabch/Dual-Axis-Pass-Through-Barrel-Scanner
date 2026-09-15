@@ -378,6 +378,7 @@ from hardware.run_precision_scan import (
     PipelineError
 )
 from scan_sequence import run_scan_sequence, ModbusLink, ESS17Controller, IDM57Controller
+from hardware.waveshare_pwm_led_demo import WavesharePwmController
 from reconstruction.barrel_reconstruct import run_reconstruction_pipeline # Assumed entry point
 from reconstruction.barrel_batch import save_to_log # Assumed entry point
 from hardware.creality_autostart import CrealityAutomator, AutomationError
@@ -396,6 +397,16 @@ log = logging.getLogger("OperatorDashboard")
 
 # How often the dashboard re-checks turret/scanner connectivity, in milliseconds.
 POLL_INTERVAL_MS = 5000
+
+# Manual LED override button colours. The lit state gets amber rather than the
+# theme blue so that "the lamps are still on" is readable from across the room --
+# this is a latch that survives scans, and an operator who forgets it is on walks
+# away leaving the rig burning. (light, dark) pairs, as CustomTkinter expects;
+# the off pair is the stock blue-theme button so the button looks normal at rest.
+MANUAL_LED_OFF_COLOR = ("#3B8ED0", "#1F6AA5")
+MANUAL_LED_OFF_HOVER = ("#36719F", "#144870")
+MANUAL_LED_ON_COLOR = ("#C77700", "#B86E00")
+MANUAL_LED_ON_HOVER = ("#A56300", "#8F5600")
 
 class AppState(Enum):
     READY = auto()
@@ -446,6 +457,25 @@ class AppGUI(ctk.CTk):
         self.worker_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.last_results: Optional[dict] = None
+
+        # --- Manual LED override (technician panel) ---
+        # A latched "lights on" for setup, focusing and visual inspection, kept
+        # deliberately separate from led_settings.enabled (which only governs the
+        # automatic brightness changes during a scan). Once switched on it stays on
+        # -- through scans, through idle -- until the operator switches it off or
+        # closes the dashboard, which is why on_close() below is wired up: a GUI
+        # killed with the window X must not leave the lamps burning.
+        self.manual_led_ctrl: Optional[WavesharePwmController] = None
+        self.manual_led_on = False
+        # The settings the lamps were actually switched on with. Kept separate from
+        # the live entry fields so that switching off, or re-asserting after a scan,
+        # always addresses the channel that was lit -- not whatever the technician
+        # has since typed into the port/slave/channel boxes.
+        self.manual_led_cfg: dict = {}
+        # Dragging a CTkSlider fires its command on every pixel of travel. Each of
+        # those would be a Modbus transaction on the shared half-duplex bus, so
+        # slider moves are coalesced into one write via this pending after() id.
+        self._manual_led_slider_job = None
 
         # Config state
         self.scan_config = load_config()
@@ -499,6 +529,9 @@ class AppGUI(ctk.CTk):
         self.frames = {}
         self.init_frames()
         
+        # Closing the window must put the lamps out -- see on_close().
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
         # Start Connectivity Polling
         self.poll_connections()
         # Start Queue Listener
@@ -971,6 +1004,10 @@ class AppGUI(ctk.CTk):
         finally:
             if self.watchdog:
                 self.watchdog.stop()
+            # The scan's own LED controller zeroes the duty cycle on its way out,
+            # which would quietly defeat a manual override the technician left
+            # latched on. Put it back now that the bus is free.
+            self._reassert_manual_led()
 
     def _translate_reconstruction_result(self, recon_result: dict) -> dict:
         """
@@ -1452,6 +1489,42 @@ class AppGUI(ctk.CTk):
             sliders_frame, "Each Rotation Brightness:"
         )
 
+        # --- Manual LED override -------------------------------------------
+        # Independent of the "Enable LED Control" checkbox above: that one governs
+        # the automatic per-phase brightness during a scan, this one is a latch the
+        # technician holds on while setting up the barrel.
+        manual_box = ctk.CTkFrame(led_box)
+        manual_box.pack(fill="x", padx=20, pady=(5, 15))
+
+        ctk.CTkLabel(
+            manual_box, text="Manual LED Override", font=("Roboto", 14, "bold")
+        ).pack(anchor="w", padx=15, pady=(10, 0))
+        ctk.CTkLabel(
+            manual_box,
+            text="Stays on until you switch it off or close this dashboard. "
+                 "Uses the port/slave/channel fields above -- no need to save first.",
+            font=("Roboto", 11), text_color="gray", justify="left",
+        ).pack(anchor="w", padx=15, pady=(0, 8))
+
+        self.manual_led_slider, self.manual_led_lbl = self._make_brightness_slider(
+            manual_box, "Manual Brightness:"
+        )
+        self.manual_led_slider.configure(command=self._on_manual_brightness_slide)
+
+        manual_row = ctk.CTkFrame(manual_box, fg_color="transparent")
+        manual_row.pack(fill="x", padx=15, pady=(5, 12))
+
+        self.manual_led_btn = ctk.CTkButton(
+            manual_row, text="Turn LEDs ON", width=160,
+            command=self.toggle_manual_led,
+        )
+        self.manual_led_btn.pack(side="left")
+
+        self.manual_led_status_lbl = ctk.CTkLabel(
+            manual_row, text="LEDs off", text_color="gray", anchor="w"
+        )
+        self.manual_led_status_lbl.pack(side="left", padx=15)
+
         # LED widgets didn't exist yet during the populate_gui_config_fields() call
         # above (it's run once for the motor/sweep fields before this section is
         # built) -- re-run it now so the LED fields pick up self.scan_config too.
@@ -1515,6 +1588,270 @@ class AppGUI(ctk.CTk):
         pct = max(0.0, min(100.0, float(pct)))
         slider.set(pct)
         value_lbl.configure(text=f"{pct:.0f}%")
+
+    # -----------------------------------------------------------------------
+    # Manual LED override
+    # -----------------------------------------------------------------------
+    def _current_led_settings(self) -> dict:
+        """LED settings as the technician panel currently shows them.
+
+        Reads the live entry widgets on top of the saved led_settings so the
+        override button acts on what is on screen. Requiring a "Save Configuration"
+        round-trip first would be a trap: the usual reason to touch these fields is
+        that the lamps did not come on and the port or slave id needs correcting.
+        Unparseable fields fall back to the saved value rather than blocking.
+        """
+        cfg = dict(self.scan_config.get("led_settings", {}))
+
+        def _field(attr: str, key: str, cast):
+            if not hasattr(self, attr):
+                return
+            raw = getattr(self, attr).get().strip()
+            if not raw:
+                return
+            try:
+                cfg[key] = cast(raw)
+            except (TypeError, ValueError):
+                log.warning(
+                    "Ignoring invalid LED %s field %r; using saved value %r.",
+                    key, raw, cfg.get(key),
+                )
+
+        _field("led_port_entry", "port", str)
+        _field("led_baud_entry", "baudrate", int)
+        _field("led_slave_entry", "slave_id", int)
+        _field("led_channel_entry", "channel", lambda v: max(1, min(4, int(v))))
+        _field("led_freq_entry", "freq_hz", float)
+
+        if hasattr(self, "manual_led_slider"):
+            cfg["manual_brightness_pct"] = float(self.manual_led_slider.get())
+        return cfg
+
+    def _open_manual_led_controller(self, led_cfg: dict) -> WavesharePwmController:
+        """Open (or borrow) a connection to the PWM board for the manual override.
+
+        Mirrors scan_sequence._init_led_controller: when the board is wired to the
+        drives' RS485 bus -- the normal setup here, one adapter on COM3 serving
+        several slave ids -- it must reuse the GUI's open client and lock. A second
+        handle to the same COM port fails outright on Windows, and two threads
+        transacting on one half-duplex bus corrupt each other's frames.
+
+        Raises on failure; the caller turns that into a status message.
+        """
+        led_port = str(led_cfg.get("port", "COM4"))
+        led_baud = int(led_cfg.get("baudrate", 9600))
+        led_slave = int(led_cfg.get("slave_id", 1))
+
+        shared_client = None
+        shared_lock = None
+        if self.link is not None and led_port.strip().upper() == str(self.link.port).strip().upper():
+            m_cfg = self.scan_config.get("motor_settings", {})
+            motor_ids = {
+                int(m_cfg.get("tilt_slave_id", UNIT_ID_TILT)),
+                int(m_cfg.get("rot_slave_id", UNIT_ID_PAN)),
+            }
+            if led_slave in motor_ids:
+                raise RuntimeError(
+                    f"LED slave id {led_slave} collides with a motor on {led_port} "
+                    f"(motor ids {sorted(motor_ids)}). Reprogram the PWM board's address."
+                )
+            if led_baud != int(self.link.baudrate):
+                log.warning(
+                    "LED baud (%s) differs from the motor bus (%s) on %s. One RS485 bus "
+                    "runs at ONE baud rate; the board will not answer until reprogrammed.",
+                    led_baud, self.link.baudrate, led_port,
+                )
+            shared_client = self.link.client
+            shared_lock = self.link.lock
+            log.info("Manual LED: sharing the motor bus on %s (slave %s).", led_port, led_slave)
+
+        ctrl = WavesharePwmController(
+            port=led_port,
+            baudrate=led_baud,
+            slave_id=led_slave,
+            client=shared_client,
+            lock=shared_lock,
+        )
+        ctrl.connect()
+        return ctrl
+
+    def toggle_manual_led(self):
+        """Latch the LEDs on, or switch them back off.
+
+        The actual Modbus work runs on a worker thread: a transaction against a
+        board that is not answering burns the full timeout, and freezing Tk's main
+        loop for that long makes the whole dashboard look hung.
+        """
+        if self._automation_active.is_set():
+            self._update_manual_led_controls("Busy: scanner automation in progress", "orange")
+            return
+
+        turn_on = not self.manual_led_on
+        led_cfg = self._current_led_settings()
+        self.manual_led_btn.configure(state="disabled")
+        self.manual_led_status_lbl.configure(
+            text="Switching on..." if turn_on else "Switching off...", text_color="gray"
+        )
+        threading.Thread(
+            target=self._manual_led_worker, args=(turn_on, led_cfg), daemon=True
+        ).start()
+
+    def _manual_led_worker(self, turn_on: bool, led_cfg: dict):
+        """Worker-thread half of toggle_manual_led()."""
+        try:
+            if turn_on:
+                if self.manual_led_ctrl is None:
+                    self.manual_led_ctrl = self._open_manual_led_controller(led_cfg)
+                duty = float(led_cfg.get("manual_brightness_pct", 100.0))
+                try:
+                    self.manual_led_ctrl.set_channel_config(
+                        channel=led_cfg.get("channel", 1),
+                        freq_hz=led_cfg.get("freq_hz", 1000.0),
+                        duty_pct=duty,
+                    )
+                except Exception:
+                    # Opened but could not be driven. Drop the controller so the next
+                    # press is a clean retry rather than reusing a half-dead handle
+                    # (and, if we opened the port ourselves, so it is released).
+                    ctrl, self.manual_led_ctrl = self.manual_led_ctrl, None
+                    try:
+                        ctrl.close()
+                    except Exception:
+                        pass
+                    raise
+                self.manual_led_cfg = led_cfg
+                self.manual_led_on = True
+                msg = (
+                    f"LEDs ON at {duty:.0f}% "
+                    f"(slave {led_cfg.get('slave_id', 1)}, ch {led_cfg.get('channel', 1)})"
+                )
+                color = "green"
+                log.info("Manual LED override on: %s", msg)
+            else:
+                err = self._extinguish_manual_led()
+                msg = "LEDs off" if err is None else f"Switched off with errors: {err}"
+                color = "gray" if err is None else "orange"
+        except Exception as e:
+            self.manual_led_on = False
+            msg, color = f"LED error: {e}", "red"
+            log.error("Manual LED toggle failed: %s", e)
+
+        self.after(0, lambda: self._update_manual_led_controls(msg, color))
+
+    def _extinguish_manual_led(self) -> Optional[str]:
+        """Duty cycle to 0% and release the controller. Safe to call from any thread.
+
+        Returns None on success, or a message describing what went wrong -- callers
+        on the shutdown path want to log and carry on, never to raise.
+        """
+        ctrl = self.manual_led_ctrl
+        self.manual_led_ctrl = None
+        self.manual_led_on = False
+        if ctrl is None:
+            return None
+        problem = None
+        try:
+            ctrl.set_channel_duty(self.manual_led_cfg.get("channel", 1), 0.0)
+        except Exception as e:
+            problem = str(e)
+            log.warning("Failed to zero the manual LED duty cycle: %s", e)
+        try:
+            ctrl.close()
+        except Exception:
+            pass
+        return problem
+
+    def _update_manual_led_controls(self, message: str, color: str):
+        """Main-thread refresh of the override button and its status line."""
+        if not hasattr(self, "manual_led_btn"):
+            return
+        self.manual_led_btn.configure(
+            state="normal",
+            text="Turn LEDs OFF" if self.manual_led_on else "Turn LEDs ON",
+            fg_color=MANUAL_LED_ON_COLOR if self.manual_led_on else MANUAL_LED_OFF_COLOR,
+            hover_color=MANUAL_LED_ON_HOVER if self.manual_led_on else MANUAL_LED_OFF_HOVER,
+        )
+        self.manual_led_status_lbl.configure(text=message, text_color=color)
+
+    def _on_manual_brightness_slide(self, value):
+        """Slider handler: always relabel, and re-drive the lamps if they are lit.
+
+        Writes are coalesced -- a drag across the slider fires this once per pixel
+        of travel, and every write is a transaction on the bus the motors share.
+        """
+        self.manual_led_lbl.configure(text=f"{float(value):.0f}%")
+        if not self.manual_led_on:
+            return
+        if self._manual_led_slider_job is not None:
+            self.after_cancel(self._manual_led_slider_job)
+        self._manual_led_slider_job = self.after(250, self._apply_manual_brightness)
+
+    def _apply_manual_brightness(self):
+        """Push the slider's settled value to the board, off the main thread."""
+        self._manual_led_slider_job = None
+        if not self.manual_led_on or self.manual_led_ctrl is None:
+            return
+        duty = max(0.0, min(100.0, float(self.manual_led_slider.get())))
+
+        def _write():
+            try:
+                self.manual_led_ctrl.set_channel_duty(
+                    self.manual_led_cfg.get("channel", 1), duty
+                )
+                self.manual_led_cfg["manual_brightness_pct"] = duty
+                text = (
+                    f"LEDs ON at {duty:.0f}% "
+                    f"(slave {self.manual_led_cfg.get('slave_id', 1)}, "
+                    f"ch {self.manual_led_cfg.get('channel', 1)})"
+                )
+                self.after(0, lambda: self._update_manual_led_controls(text, "green"))
+            except Exception as e:
+                log.warning("Failed to update manual LED brightness: %s", e)
+                self.after(0, lambda err=e: self._update_manual_led_controls(
+                    f"Brightness update failed: {err}", "orange"))
+
+        threading.Thread(target=_write, daemon=True).start()
+
+    def _reassert_manual_led(self):
+        """Re-light the manual override after a scan has finished with the lamps.
+
+        A scan with led_settings.enabled drives the same channel through its own
+        controller and zeroes the duty cycle on the way out. Correct for the scan,
+        but it would silently defeat a latch the technician expects to hold, so the
+        override is written back once the pipeline is done with the bus. Called on
+        the pipeline worker thread; failures are logged, never raised.
+        """
+        if not self.manual_led_on or self.manual_led_ctrl is None:
+            return
+        duty = float(self.manual_led_cfg.get("manual_brightness_pct", 100.0))
+        try:
+            self.manual_led_ctrl.set_channel_duty(
+                self.manual_led_cfg.get("channel", 1), duty
+            )
+            log.info("Re-asserted the manual LED override at %.0f%% after the scan.", duty)
+        except Exception as e:
+            log.warning("Failed to re-assert the manual LED override after the scan: %s", e)
+
+    def on_close(self):
+        """Window-close handler: put the lamps out before the process goes away.
+
+        Without this the manual override would outlive the dashboard -- the PWM
+        board holds its duty-cycle register by itself, so the LEDs would simply stay
+        lit with nothing left running that could switch them off.
+        """
+        log.info("Dashboard closing; releasing hardware.")
+        self._extinguish_manual_led()
+        if self.watchdog is not None:
+            try:
+                self.watchdog.stop()
+            except Exception:
+                pass
+        if self.client is not None:
+            try:
+                self.client.close()
+            except Exception:
+                pass
+        self.destroy()
 
     def _on_protractor_change(self, pulses: List[int]):
         """Sync protractor changes with the secondary raw encoder text entry."""
@@ -1641,6 +1978,9 @@ class AppGUI(ctk.CTk):
         if hasattr(self, "led_rot_slider"):
             self._set_brightness_slider(self.led_rot_slider, self.led_rot_lbl, led_cfg.get("rotation_brightness_pct", 100.0))
 
+        if hasattr(self, "manual_led_slider"):
+            self._set_brightness_slider(self.manual_led_slider, self.manual_led_lbl, led_cfg.get("manual_brightness_pct", 100.0))
+
     def save_gui_config(self):
         """Save input values from GUI into self.scan_config and write to scan_config.json."""
         try:
@@ -1690,6 +2030,8 @@ class AppGUI(ctk.CTk):
                 led_cfg["tilt_pass_brightness_pct"] = float(self.led_tilt_slider.get())
             if hasattr(self, "led_rot_slider"):
                 led_cfg["rotation_brightness_pct"] = float(self.led_rot_slider.get())
+            if hasattr(self, "manual_led_slider"):
+                led_cfg["manual_brightness_pct"] = float(self.manual_led_slider.get())
 
             self.scan_config["motor_settings"] = m_cfg
             self.scan_config["sweep_settings"] = s_cfg
